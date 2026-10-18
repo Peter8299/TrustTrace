@@ -282,7 +282,7 @@ async function renderSettings(app) {
 
   panel.appendChild(el("h3", { text: "AI Defaults", style: "margin-top:18px;" }));
 
-  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"], default_models: {} };
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini", "openai-compatible"], default_models: {} };
   try {
     providerInfo = await apiGet("/ai-providers");
   } catch (e) {
@@ -2231,7 +2231,7 @@ async function renderInvestigatePanel(panel, c, result) {
   aiBox.appendChild(el("div", { class: "empty", text: "Not requested - this calls an external AI service (optional)." }));
   panel.appendChild(aiBox);
 
-  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"], default_models: {} };
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini", "openai-compatible"], default_models: {} };
   try {
     providerInfo = await apiGet("/ai-providers");
   } catch (e) {
@@ -2242,6 +2242,7 @@ async function renderInvestigatePanel(panel, c, result) {
     openai: "OpenAI API key (optional if OPENAI_API_KEY set server-side)",
     gemini: "Gemini API key (optional if GEMINI_API_KEY set server-side)",
     ollama: "Not needed - Ollama runs locally",
+    "openai-compatible": "API key for OpenAI-compatible endpoint (optional if OPENAI_COMPATIBLE_API_KEY set server-side)",
   };
 
   const aiRow = el("div", { class: "filter-bar" });
@@ -2266,8 +2267,12 @@ async function renderInvestigatePanel(panel, c, result) {
   aiProviderSelect.addEventListener("change", () => {
     const p = aiProviderSelect.value;
     aiKeyInput.placeholder = PROVIDER_KEY_HINTS[p] || "API key";
+    const showBaseUrl = p === "ollama" || p === "openai-compatible";
     aiKeyInput.style.display = p === "ollama" ? "none" : "";
-    aiBaseUrlInput.style.display = p === "ollama" ? "" : "none";
+    aiBaseUrlInput.style.display = showBaseUrl ? "" : "none";
+    aiBaseUrlInput.placeholder = p === "ollama"
+      ? "Ollama server URL (default http://127.0.0.1:11434)"
+      : "Base URL for OpenAI-compatible endpoint (e.g., https://openrouter.ai/api/v1)";
     aiModelInput.placeholder = `Model override (default: ${providerInfo.default_models[p] || "provider default"})`;
   });
 
@@ -3887,7 +3892,7 @@ async function renderTeam(app, c) {
     return;
   }
 
-  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"] };
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini", "openai-compatible"] };
   try {
     providerInfo = await apiGet("/ai-providers");
   } catch (e) {
@@ -4377,7 +4382,7 @@ async function renderFiles(app, c, focusPath) {
 // "no AI" says plainly what still works. Detection comes from /api/ai/status
 // (core/ai_setup.py), which never returns a key.
 
-const AI_CLOUD_ORDER = ["anthropic", "openai", "gemini"];
+const AI_CLOUD_ORDER = ["anthropic", "openai", "gemini", "openai-compatible"];
 
 async function renderAiSetup(container, opts) {
   const options = opts || {};

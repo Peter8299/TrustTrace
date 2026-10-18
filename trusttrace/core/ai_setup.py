@@ -33,6 +33,7 @@ CLOUD_PROVIDERS = {
     "anthropic": {"name": "Anthropic (Claude)", "key": "anthropic_api_key", "get_key": "https://console.anthropic.com/"},
     "openai": {"name": "OpenAI", "key": "openai_api_key", "get_key": "https://platform.openai.com/api-keys"},
     "gemini": {"name": "Google Gemini", "key": "gemini_api_key", "get_key": "https://aistudio.google.com/apikey"},
+    "openai-compatible": {"name": "OpenAI-Compatible (OpenRouter, NVIDIA, Groq, etc.)", "key": "openai_compatible_api_key", "get_key": "https://openrouter.ai/keys"},
 }
 
 OLLAMA_PROBE_TIMEOUT_SECONDS = 2
