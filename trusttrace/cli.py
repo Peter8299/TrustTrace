@@ -2455,6 +2455,9 @@ def web(
         help="Extra Host name to accept besides localhost/127.0.0.1/[::1], e.g. a trusted local "
         "reverse proxy's name. Repeatable. Other names are refused (DNS-rebinding protection).",
     ),
+    open_browser: bool = typer.Option(
+        False, "--open", help="Open the web UI in the default browser after starting"
+    ),
 ):
     """Launch the local web UI: browse cases, upload/analyze evidence,
     investigate entities, manage findings, run live capture, and generate
@@ -2488,6 +2491,18 @@ def web(
     if auth_token and not is_loopback:
         entry += "/?token=<your token>"
     typer.echo(f"TrustTrace web UI running at {entry} (Ctrl+C to stop)")
+
+    # Open browser if requested (only for loopback to avoid opening with token in URL)
+    if open_browser and is_loopback:
+        url = f"{scheme}://localhost:{port}"
+        typer.echo(f"Opening {url} in browser...")
+        typer.launch(url)
+    elif open_browser and not is_loopback:
+        typer.echo(
+            "WARNING: --open only works with loopback (127.0.0.1). "
+            "Not opening browser when binding to external host.",
+            err=True,
+        )
 
     # Single-threaded deliberately: CaseStore/DuckDB is single-writer, and
     # this is a local single-user tool - see web/app.py's module docstring.
