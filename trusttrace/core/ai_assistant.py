@@ -47,7 +47,7 @@ from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PROVIDERS = ("anthropic", "openai", "ollama", "gemini")
+SUPPORTED_PROVIDERS = ("anthropic", "openai", "ollama", "gemini", "openai-compatible")
 
 # Sane defaults, not the only option - every entry point (CLI --model,
 # the web API's "model" field) lets the investigator override these.
@@ -67,6 +67,7 @@ DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "ollama": "llama3.1",
     "gemini": "gemini-3.6-flash",
+    "openai-compatible": "gpt-4o-mini",  # fallback default
 }
 
 # Substrings marking a failure that is worth retrying: provider capacity
@@ -234,6 +235,7 @@ def call_model(system_prompt, user_prompt, provider="anthropic", api_key=None, m
         "anthropic": "anthropic_api_key",
         "openai": "openai_api_key",
         "gemini": "gemini_api_key",
+        "openai-compatible": "openai_compatible_api_key",
     }.get(provider)
     if config_key_name:
         api_key = config.get_secret(config_key_name, api_key)
@@ -246,6 +248,9 @@ def call_model(system_prompt, user_prompt, provider="anthropic", api_key=None, m
         # default and a remote host needs a deliberate opt-in.
         _validate_ollama_base_url(base_url or DEFAULT_OLLAMA_BASE_URL)
 
+    if provider == "openai-compatible":
+        base_url = base_url or config.get_plain("openai_compatible_base_url") or None
+
     model = model or DEFAULT_MODELS[provider]
 
     def call_provider():
@@ -255,6 +260,8 @@ def call_model(system_prompt, user_prompt, provider="anthropic", api_key=None, m
             return _call_openai(system_prompt, user_prompt, api_key, model, schema)
         if provider == "ollama":
             return _call_ollama(system_prompt, user_prompt, model, base_url or DEFAULT_OLLAMA_BASE_URL, schema)
+        if provider == "openai-compatible":
+            return _call_openai_compatible(system_prompt, user_prompt, api_key, model, base_url, schema)
         return _call_gemini(system_prompt, user_prompt, api_key, model, schema)
 
     return _with_transient_retry(call_provider, provider)
@@ -593,6 +600,70 @@ def _call_ollama(system_prompt, user_prompt, model, base_url, schema=None):
     if not content:
         raise AssistantError("AI response could not be parsed into the expected format.")
     return _json_from_text(content)
+
+
+def _call_openai_compatible(system_prompt, user_prompt, api_key, model, base_url, schema=None):
+    """Call any OpenAI-compatible API (OpenRouter, NVIDIA NIM, Groq, Together, etc.).
+
+    Uses the OpenAI SDK which works with any OpenAI-compatible endpoint.
+    Requires base_url to be set (e.g., https://openrouter.ai/api/v1,
+    https://integrate.api.nvidia.com/v1, etc.)
+    """
+    try:
+        import openai
+    except ImportError as e:
+        raise AssistantError(
+            "The 'openai' package isn't installed. Install with: pip install 'trusttrace[ai-openai]'"
+        ) from e
+
+    if not base_url:
+        raise AssistantError(
+            "OpenAI-compatible provider requires --base-url (e.g., https://openrouter.ai/api/v1, "
+            "https://integrate.api.nvidia.com/v1, https://api.groq.com/openai/v1)"
+        )
+
+    no_credentials_message = (
+        "No API key for OpenAI-compatible endpoint. "
+        "Use --api-key or set OPENAI_COMPATIBLE_API_KEY (or provider-specific env var)."
+    )
+    try:
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if schema is None:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_completion_tokens=MAX_TOKENS,
+            )
+        else:
+            response = client.beta.chat.completions.parse(
+                model=model,
+                messages=messages,
+                response_format=schema,
+                max_completion_tokens=MAX_TOKENS,
+            )
+    except openai.AuthenticationError as e:
+        raise AssistantError(_rejected_message("OpenAI-compatible", "--api-key or OPENAI_COMPATIBLE_API_KEY")) from e
+    except openai.OpenAIError as e:
+        if "credentials" in str(e).lower() or "api_key" in str(e).lower():
+            raise AssistantError(no_credentials_message) from e
+        raise AssistantError(f"AI request failed: {e}") from e
+    except openai.APIConnectionError as e:
+        raise AssistantError(f"AI request failed: network error - {e}") from e
+    except openai.APIStatusError as e:
+        raise AssistantError(f"AI request failed: {e.message}") from e
+
+    message = response.choices[0].message
+    if schema is None:
+        return _json_from_text(message.content)
+    if message.parsed is None:
+        refusal = f" ({message.refusal})" if getattr(message, "refusal", None) else ""
+        raise AssistantError(f"AI response could not be parsed into the expected format.{refusal}")
+    return message.parsed.model_dump()
 
 
 def record_hypothesis_request(case_dir, *, provider, model, entity_type, value, events_sent, outcome, actor=None,

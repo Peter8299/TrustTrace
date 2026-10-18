@@ -31,7 +31,7 @@ def _ai_settings(provider, model, base_url):
     return (
         provider or config.get_plain("ai_provider"),
         model or config.get_plain("ai_model") or None,
-        base_url or config.get_plain("ollama_base_url") or None,
+        base_url or config.get_plain("ollama_base_url") or config.get_plain("openai_compatible_base_url") or None,
     )
 
 # Mirrors core.search / core.streams. Duplicated as literals because a
@@ -698,16 +698,19 @@ def investigate(
     ai_provider: str = typer.Option(
         None,
         "--ai-provider",
-        help="AI provider for --ai: anthropic, openai, ollama, or gemini (default: your saved Settings, else anthropic)",
+        help="AI provider for --ai: anthropic, openai, ollama, gemini, or openai-compatible (default: your saved Settings, else anthropic)",
     ),
     api_key: str = typer.Option(
         None,
         "--api-key",
         help="API key for --ai (falls back to the provider's usual env var: ANTHROPIC_API_KEY / "
-        "OPENAI_API_KEY / GEMINI_API_KEY; not needed for ollama)",
+        "OPENAI_API_KEY / GEMINI_API_KEY / OPENAI_COMPATIBLE_API_KEY; not needed for ollama)",
     ),
     ai_model: str = typer.Option(
         None, "--model", help="Model name override for --ai (defaults to a sane per-provider default)"
+    ),
+    base_url: str = typer.Option(
+        None, "--base-url", help="Base URL for --ai-provider openai-compatible (e.g., https://openrouter.ai/api/v1, https://integrate.api.nvidia.com/v1)"
     ),
     ollama_url: str = typer.Option(
         None, "--ollama-url", help="Ollama server URL for --ai-provider ollama (default http://127.0.0.1:11434)"
@@ -834,7 +837,7 @@ def investigate(
 
             try:
                 hypothesis = generate_hypothesis(
-                    result.events, provider=ai_provider, api_key=api_key, model=ai_model, base_url=ollama_url
+                    result.events, provider=ai_provider, api_key=api_key, model=ai_model, base_url=base_url or ollama_url
                 )
             except AssistantError as e:
                 _record_ai("failed", error=str(e))
@@ -1798,11 +1801,12 @@ def chat_cmd(
     case_id: str = typer.Option(..., "--case", help="Case ID to ask about"),
     question: str = typer.Argument(None, help="Your question (omit for an interactive session)"),
     provider: str = typer.Option(
-        None, "--ai-provider", help="anthropic, openai, ollama, or gemini (default: your saved Settings, else anthropic)"
+        None, "--ai-provider", help="anthropic, openai, ollama, gemini, or openai-compatible (default: your saved Settings, else anthropic)"
     ),
     ai_model: str = typer.Option(None, "--model", help="Override the provider's default model"),
     api_key: str = typer.Option(None, "--api-key", help="API key (falls back to env var, then saved config)"),
-    base_url: str = typer.Option(None, "--ollama-url", help="Ollama base URL"),
+    base_url: str = typer.Option(None, "--base-url", help="Base URL for --ai-provider openai-compatible"),
+    ollama_url: str = typer.Option(None, "--ollama-url", help="Ollama base URL"),
     max_steps: int = typer.Option(
         CHAT_DEFAULT_MAX_STEPS, "--max-steps", help="Tool calls allowed before the model must answer"
     ),
@@ -1896,11 +1900,12 @@ def team_cmd(
         help="Comma-separated roles to run, e.g. network,host (default: every role whose evidence is in the case)",
     ),
     provider: str = typer.Option(
-        None, "--ai-provider", help="anthropic, openai, ollama, or gemini (default: your saved Settings, else anthropic)"
+        None, "--ai-provider", help="anthropic, openai, ollama, gemini, or openai-compatible (default: your saved Settings, else anthropic)"
     ),
     ai_model: str = typer.Option(None, "--model", help="Override the provider's default model"),
     api_key: str = typer.Option(None, "--api-key", help="API key (falls back to env var, then saved config)"),
-    base_url: str = typer.Option(None, "--ollama-url", help="Ollama base URL"),
+    base_url: str = typer.Option(None, "--base-url", help="Base URL for --ai-provider openai-compatible"),
+    ollama_url: str = typer.Option(None, "--ollama-url", help="Ollama base URL"),
     max_steps: int = typer.Option(None, "--max-steps", min=1, help="Tool calls each role may make (default: 6)"),
     save_findings: bool = typer.Option(
         False,

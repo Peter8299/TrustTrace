@@ -41,12 +41,14 @@ SECRET_KEYS = {
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
     "gemini_api_key": "GEMINI_API_KEY",
+    "openai_compatible_api_key": "OPENAI_COMPATIBLE_API_KEY",
 }
 
 PLAIN_KEYS = {
     "ai_provider": "anthropic",
     "ai_model": "",
     "ollama_base_url": "",
+    "openai_compatible_base_url": "",
     # Which pcap dissection engine to use: "auto" (tshark when Wireshark
     # is installed, otherwise scapy), "tshark", or "scapy". See
     # parsers/pcap_engine.py.
