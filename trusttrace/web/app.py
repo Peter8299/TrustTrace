@@ -748,7 +748,7 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
                 return jsonify({"ok": False, "message": f"VirusTotal rejected the request: {result['error']}"})
             return jsonify({"ok": True, "message": "VirusTotal key works."})
 
-        if target in ("anthropic", "openai", "gemini", "ollama"):
+        if target in ("anthropic", "openai", "gemini", "ollama", "openai-compatible"):
             from trusttrace.core.ai_assistant import AssistantError, generate_hypothesis
             from trusttrace.core.event import Event
 
