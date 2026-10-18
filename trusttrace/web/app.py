@@ -751,6 +751,7 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
         if target in ("anthropic", "openai", "gemini", "ollama", "openai-compatible"):
             from trusttrace.core.ai_assistant import AssistantError, generate_hypothesis
             from trusttrace.core.event import Event
+            from trusttrace.core import config
 
             probe = Event(
                 event_id="EVT-PROBE-0001",
@@ -760,12 +761,15 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
                 message="Connectivity probe - not real evidence.",
             )
             try:
+                # For openai-compatible, fall back to saved base_url if not in payload
+                base_url = payload.get("base_url") or (config.get_plain("openai_compatible_base_url") if target == "openai-compatible" else None)
+                model = payload.get("model") or config.get_plain("ai_model") or None
                 generate_hypothesis(
                     [probe],
                     provider=target,
                     api_key=payload.get("api_key") or None,
-                    model=payload.get("model") or None,
-                    base_url=payload.get("base_url") or None,
+                    model=model,
+                    base_url=base_url,
                 )
             except AssistantError as e:
                 return jsonify({"ok": False, "message": str(e)})
