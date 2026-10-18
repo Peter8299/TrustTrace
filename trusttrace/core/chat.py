@@ -548,9 +548,12 @@ def _finalize(raw, question, ledger, steps, transcript, call):
         try:
             raw = call(SYSTEM_PROMPT, "\n\n".join(transcript))
         except Exception as e:
-            raise ChatError(f"AI provider failed during citation correction: {e}") from e
+            # If the correction fails (e.g., malformed JSON from provider),
+            # refuse the answer rather than showing an error.
+            logger.warning(f"Citation correction failed: {e}")
+            break
         if not isinstance(raw, dict):
-            raise ChatError("AI correction response was not a JSON object.")
+            break
 
     listed = ", ".join(f"{c.kind} {c.evidence_id}/{c.reference}" for c in unverifiable)
     raise ChatError(

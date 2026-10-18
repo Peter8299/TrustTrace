@@ -3770,8 +3770,38 @@ async function renderChat(app, c) {
     })
   );
 
+  // Persistent chat history per case
+  const storageKey = `chat-history-${c.case_id}`;
+  let history = [];
+  try {
+    const stored = sessionStorage.getItem(storageKey);
+    if (stored) history = JSON.parse(stored);
+  } catch (_) {}
+
   const log = el("div", { class: "chat-log" });
   app.appendChild(log);
+
+  // Restore history
+  for (const msg of history) {
+    if (msg.role === "user") {
+      log.appendChild(el("div", { class: "bubble-me", text: msg.content }));
+    } else {
+      log.appendChild(el("div", { class: "answer", text: msg.content }));
+      if (msg.citations && msg.citations.length) {
+        const cites = el("div", { class: "cites" });
+        cites.appendChild(el("span", { class: "dim", text: "Cited evidence:" }));
+        for (const cit of msg.citations) {
+          const label = `${cit.kind} ${cit.reference}`;
+          if (cit.kind === "stream") {
+            cites.appendChild(el("a", { class: "cite", href: `#/case/${c.case_id}/streams/${cit.reference}`, text: label }));
+          } else {
+            cites.appendChild(el("span", { class: "cite", text: label }));
+          }
+        }
+        log.appendChild(cites);
+      }
+    }
+  }
 
   const bar = el("div", { class: "filter-bar" });
   const q = el("input", { placeholder: "Was anything downloaded from an external host?", style: "flex-grow:1;min-width:320px" });
@@ -3824,6 +3854,12 @@ async function renderChat(app, c) {
         }
         log.appendChild(cites);
       }
+
+      // Save to history
+      history.push({ role: "user", content: question });
+      history.push({ role: "assistant", content: r.answer, citations: r.citations, evidence_sufficient: r.evidence_sufficient });
+      saveHistory();
+
     } catch (e) {
       pending.remove();
       // A refusal is not a crash - it is the contract working. Say so.
@@ -4485,6 +4521,27 @@ async function renderAiSetup(container, opts) {
     if (slug === s.provider) o.setAttribute("selected", "selected");
     provider.appendChild(o);
   }
+
+  // Base URL input for openai-compatible
+  const baseUrlRow = el("div", { class: "filter-bar", style: "display:none; margin-top:8px;" });
+  const baseUrlInput = el("input", {
+    type: "text",
+    placeholder: "Base URL (e.g., https://integrate.api.nvidia.com/v1, https://openrouter.ai/api/v1)",
+    style: "flex:1; min-width:300px;"
+  });
+  baseUrlRow.appendChild(el("label", { class: "dim", text: "Base URL" }));
+  baseUrlRow.appendChild(baseUrlInput);
+
+  // Model input for openai-compatible
+  const modelRow = el("div", { class: "filter-bar", style: "display:none; margin-top:8px;" });
+  const modelInput = el("input", {
+    type: "text",
+    placeholder: "Model ID (e.g., nvidia/nemotron-3-ultra-550b-a55b, meta/llama-3.3-70b-instruct)",
+    style: "flex:1; min-width:300px;"
+  });
+  modelRow.appendChild(el("label", { class: "dim", text: "Model" }));
+  modelRow.appendChild(modelInput);
+
   const key = el("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: "Paste the API key…" });
   const getKey = el("a", { target: "_blank", rel: "noopener noreferrer" });
   const syncHint = () => {
@@ -4492,9 +4549,14 @@ async function renderAiSetup(container, opts) {
     getKey.href = info.get_key_url;
     getKey.textContent = `Get an API key from ${info.name}`;
     key.placeholder = info.key_set ? `Saved (${info.key_hint}) - paste a new one to replace it…` : "Paste the API key…";
+    // Show/hide base URL and model for openai-compatible
+    const show = provider.value === "openai-compatible";
+    baseUrlRow.style.display = show ? "" : "none";
+    modelRow.style.display = show ? "" : "none";
   };
   provider.addEventListener("change", syncHint);
   syncHint();
+
   const save = el("button", { type: "button", text: "Save and test" });
   const result = el("div", { class: "dim", "aria-live": "polite" });
   save.addEventListener("click", async () => {
@@ -4509,6 +4571,11 @@ async function renderAiSetup(container, opts) {
     try {
       const body = { ai_provider: slug, ai_model: "" };
       if (key.value.trim()) body[`${slug}_api_key`] = key.value.trim();
+      // Include base_url and model for openai-compatible
+      if (slug === "openai-compatible") {
+        if (baseUrlInput.value.trim()) body.openai_compatible_base_url = baseUrlInput.value.trim();
+        if (modelInput.value.trim()) body.ai_model = modelInput.value.trim();
+      }
       await apiPost("/settings", body);
       key.value = "";
       const t = await apiPost("/settings/test", { target: slug });
@@ -4522,6 +4589,8 @@ async function renderAiSetup(container, opts) {
     }
   });
   cloud.appendChild(el("div", { class: "filter-bar" }, [provider, key, save]));
+  cloud.appendChild(baseUrlRow);
+  cloud.appendChild(modelRow);
   cloud.appendChild(getKey);
   cloud.appendChild(result);
   choices.appendChild(cloud);
