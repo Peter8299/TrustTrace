@@ -1,0 +1,138 @@
+[project]
+name = "trusttrace"
+version = "0.7.0"
+description = "Local-first DFIR investigation and evidence correlation platform"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Sh3n0bi" }]
+keywords = ["dfir", "forensics", "incident-response", "pcap", "security", "evtx", "sysmon", "mitre-attack"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "typer>=0.12,<1.0",
+    "pydantic>=2.6,<3.0",
+    "duckdb>=1.0,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Sh3n0bi/TrustTrace"
+Repository = "https://github.com/Sh3n0bi/TrustTrace"
+Issues = "https://github.com/Sh3n0bi/TrustTrace/issues"
+
+[project.optional-dependencies]
+pcap = [
+    "scapy>=2.5,<3.0",
+    "pandas>=2.0,<3.0",
+    "scikit-learn>=1.3,<2.0",
+]
+intel = [
+    "requests>=2.31,<3.0",
+]
+ai = [
+    "anthropic>=1.0,<2.0",
+    "requests>=2.31,<3.0",
+]
+ai-openai = [
+    "openai>=1.40,<4.0",
+]
+ai-gemini = [
+    "google-genai>=1.0,<3.0",
+]
+evtx = [
+    "python-evtx>=0.8,<0.9",
+]
+web = [
+    # Lower bounds raised past the known-vulnerable 3.0.x line (flask
+    # PYSEC-2026-2151; werkzeug PYSEC-2026-2044/2046/2320) - the fixes are
+    # within the same 3.x major, so this just excludes the bad releases.
+    # werkzeug is pinned explicitly (not only pulled via flask) because
+    # web/app.py imports werkzeug.utils.secure_filename directly.
+    "flask>=3.1.3,<4.0",
+    "werkzeug>=3.1.6,<4.0",
+    # Production WSGI server used when the UI is bound off-loopback (see the
+    # `web` command in cli.py); the Werkzeug dev server is loopback-only.
+    "waitress>=3.0,<4.0",
+]
+dashboard = [
+    # dash 2.x caps Flask<3.1 / Werkzeug<3.1, which would pin the web extra
+    # back onto the vulnerable 3.0.x line (see the `web` extra). dash >=3.0
+    # supports the patched Flask 3.1.x, so the two extras stay co-installable.
+    "dash>=3.0,<5.0",
+    "plotly>=5.15,<8.0",
+]
+dev = [
+    "pytest>=8.0,<9.0",
+    # Coverage plugin for the CI coverage gate (see the `coverage` job in
+    # .github/workflows/tests.yml). Optional locally: `pytest --cov`.
+    "pytest-cov>=5.0,<8.0",
+    # Linter; configured in [tool.ruff] below. Pinned to match the version
+    # the CI lint gate uses (.github/workflows/tests.yml) so `ruff check`
+    # gives contributors the same result locally as in CI.
+    "ruff==0.16.9",
+]
+build = [
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.scripts]
+trusttrace = "trusttrace.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["trusttrace*"]
+
+[tool.setuptools.package-data]
+# Without this, a PyPI install has no web UI: send_from_directory() in
+# web/app.py serves these at runtime, but setuptools only bundles .py
+# files by default - static assets need to be listed explicitly.
+"trusttrace.web" = ["static/*"]
+
+[tool.ruff]
+# 3.9 is the supported floor (see requires-python). Pinning it here stops
+# ruff suggesting 3.10+ syntax (PEP 604 unions, PEP 585 generics, etc.)
+# that would break on the oldest interpreter we ship on.
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+# A focused, high-signal rule set rather than "everything": real defects
+# and modernizations, not stylistic churn.
+#   E,F  - pyflakes + pycodestyle errors (unused names, undefined refs, ...)
+#   I    - import sorting
+#   B    - bugbear (likely bugs)
+#   UP   - pyupgrade (kept 3.9-safe by target-version above)
+#   SIM  - simplifications
+#   PIE  - misc lints
+#   RUF  - ruff-specific
+#   UP is intentionally NOT selected: several of its fixes (PEP 585/604
+#   annotations, typing imports) change runtime behaviour on Python 3.9,
+#   the supported floor, so they are unsafe to apply project-wide.
+select = ["E", "F", "I", "B", "SIM", "PIE", "RUF"]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "B008",    # Typer's whole API is `= typer.Option(...)` in defaults - idiomatic here
+    "B012",    # the one finally/return is documented and deliberate (wireshark.py)
+    "B904",    # `raise ... from` chaining: domain errors deliberately hide the
+               # internal chain from users; worth revisiting but not a defect
+    "SIM105",  # `contextlib.suppress` is not clearer than a 2-line try/except in hot parsers
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately do odd things (unused unpacked fixtures, redefinitions).
+"tests/*" = ["B", "SIM", "RUF059", "F811"]

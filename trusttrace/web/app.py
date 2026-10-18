@@ -1,0 +1,1565 @@
+"""Local web UI for browsing cases: evidence, timeline, entity graph,
+findings, reports, and live capture - a thin visualization layer over the
+same core modules the CLI uses, not a second implementation of any of it.
+
+Local-first and single-user by design: binds to 127.0.0.1 by default,
+has no authentication (but only answers loopback Host names - see the
+DNS-rebinding paragraph below), and Flask's debug/reloader mode is never enabled
+here (it exposes an interactive in-browser debugger capable of arbitrary
+code execution - a serious risk if this process were ever reachable from
+a network). Only pass a different --host if you understand and accept
+exposing this to other machines.
+
+Every state-changing route requires the X-Requested-With header (see
+CSRF_HEADER below) - not because this app has sessions or cookies to
+steal, but because a browser tab open on an unrelated malicious page can
+still reach 127.0.0.1 with a "simple" cross-origin POST (multipart form
+upload, or JSON sent as text/plain) that needs no CORS preflight. Without
+this check, that page could silently submit forged "evidence" into a real
+case - undermining the chain-of-custody model this whole tool is built
+around - or start a live capture without the analyst's knowledge. A
+custom header forces the browser into a CORS preflight; since this app
+never sends Access-Control-Allow-Origin, the preflight fails and the
+browser never sends the real request. The frontend (app.js) sets this
+header on every POST it makes.
+
+That header check alone does NOT survive DNS rebinding. A malicious page
+at attacker.example can re-point its own DNS name at 127.0.0.1 after
+loading; the browser then treats this app as same-origin with the page,
+so no preflight happens, the custom header is sent freely, and responses
+are readable - full read/write access to every case. What the browser
+cannot change is the Host header: it still says attacker.example. So when
+the app runs without a token (the loopback default), every request must
+name a loopback host (see LOOPBACK_HOSTS); anything else is refused
+before any route runs. With a token, rebinding is already defeated - the
+attacker's origin never holds the credential - so the check is only
+applied there if hosts are allowed explicitly.
+
+Write surface is deliberately narrow. Evidence upload and analyze mirror
+`trusttrace evidence add` / `analyze` exactly (same EvidenceManager /
+pipeline calls) - not a second ingestion path. Threat-intel check and AI
+hypothesis trigger the same explicit, opt-in external lookups
+`investigate --vt-api` / `--ai` already perform. Live capture start/stop
+control a CaptureSession (core/capture.py) the same way `trusttrace
+capture` does. Creating or updating a Finding calls straight into
+FindingManager, the same as `trusttrace finding create/update` - still
+always an explicit, investigator-initiated action, just from either
+interface.
+
+All CaseStore access here goes through locked_store() rather than
+CaseStore(...) directly: a live capture session's background ingestion
+thread can be writing to a case's DuckDB file at the same moment a
+browser request reads it, and DuckDB is single-writer - see
+core/store.py's GLOBAL_WRITE_LOCK.
+"""
+
+import hmac
+import logging
+import shutil
+import tempfile
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+from werkzeug.utils import secure_filename
+
+from trusttrace.core.case import CaseError, CaseManager
+from trusttrace.core.correlation import DEFAULT_MAX_PAIRS as CORRELATION_MAX_PAIRS
+from trusttrace.core.event import parse_timestamp
+from trusttrace.core.evidence import EvidenceError, EvidenceManager
+from trusttrace.core.finding import FindingManager
+from trusttrace.core.investigate import investigate_entity
+from trusttrace.core.report import RENDERERS, build_report
+from trusttrace.core.store import locked_store
+from trusttrace.core.timeline import build_timeline, filter_timeline
+
+logger = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+REPORT_MIMETYPES = {"markdown": "text/markdown", "json": "application/json", "html": "text/html"}
+
+# Generous but bounded - evidence files (especially pcaps) can be large,
+# but an unbounded upload is a disk-exhaustion DoS against a local tool
+# with no auth in front of it.
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+
+# Limits on case details entered in the browser. Generous for any real
+# name or note; they exist so a pasted log file does not become a case name.
+MAX_CASE_NAME = 200
+MAX_CASE_DESCRIPTION = 2000
+MAX_INVESTIGATOR = 120
+
+# See the CSRF paragraph in the module docstring.
+CSRF_HEADER = "X-Requested-With"
+CSRF_HEADER_VALUE = "TrustTrace"
+
+# Optional shared-secret auth (see create_app's auth_token). The token may
+# arrive as this header (programmatic callers), this cookie (set after the
+# token is first supplied in the URL), or a `?token=` query parameter (the
+# one-time bootstrap a browser can use). It is the credential itself, not a
+# session id: there are no sessions to manage in a single-user local tool.
+AUTH_HEADER = "X-Auth-Token"
+AUTH_COOKIE = "nf_auth"
+AUTH_QUERY_PARAM = "token"
+
+# Host names always accepted by the DNS-rebinding guard (see the module
+# docstring). Compared against the Host header with port and IPv6 brackets
+# stripped. Deliberately exact: "localhost." or "127.0.0.1.nip.io" are not
+# loopback as far as this check is concerned.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _hostname(host):
+    """'Host' header value -> bare lowercase hostname, port removed.
+
+    Handles "name", "name:port", "[v6]" and "[v6]:port". A bare IPv6
+    address without brackets is not a valid Host header, so it is returned
+    as-is and simply fails to match.
+    """
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        return host.split(":", 1)[0]
+    return host
+
+
+def _ai_settings(payload):
+    """Provider, model and Ollama URL for an AI request: what the request
+    names, else the investigator's saved Settings, else the defaults. The
+    saved "Default AI provider" used to be ignored - every request without an
+    explicit provider silently went to anthropic."""
+    from trusttrace.core import config
+
+    return (
+        payload.get("provider") or config.get_plain("ai_provider"),
+        payload.get("model") or config.get_plain("ai_model") or None,
+        payload.get("base_url") or config.get_plain("ollama_base_url") or None,
+    )
+
+
+class ApiError(Exception):
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
+    """Build the Flask app.
+
+    auth_token: when set, every request must carry this secret (via the
+    X-Auth-Token header, the nf_auth cookie, or a one-time `?token=` query
+    parameter). This is what makes a deliberately non-loopback deployment
+    defensible - the CLI refuses to bind off-loopback without one. When it
+    is None (the default) the app is unauthenticated, for local single-user
+    use on 127.0.0.1, and only answers requests addressed to a loopback
+    host name (the DNS-rebinding guard - see the module docstring).
+
+    allowed_hosts: extra Host names to accept on top of LOOPBACK_HOSTS, e.g.
+    the name a local reverse proxy forwards. Passing it also turns the Host
+    check on when auth_token is set.
+    """
+    app = Flask(__name__, static_folder=None)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+    auth_token = auth_token or None
+    case_manager = CaseManager(cases_dir)
+
+    if allowed_hosts:
+        permitted_hosts = LOOPBACK_HOSTS | {_hostname(h) for h in allowed_hosts}
+    elif auth_token:
+        permitted_hosts = None
+    else:
+        permitted_hosts = LOOPBACK_HOSTS
+
+    def _request_is_authenticated():
+        if not auth_token:
+            return True
+        supplied = (
+            request.headers.get(AUTH_HEADER)
+            or request.cookies.get(AUTH_COOKIE)
+            or request.args.get(AUTH_QUERY_PARAM)
+        )
+        # Constant-time compare so a wrong token can't be recovered by timing.
+        return bool(supplied) and hmac.compare_digest(str(supplied), str(auth_token))
+
+    def _load_case(case_id):
+        try:
+            return case_manager.load(case_id)
+        except CaseError as e:
+            raise ApiError(str(e), 404)
+
+    def _case_dir(case):
+        return Path(cases_dir) / case.case_id
+
+    @app.errorhandler(ApiError)
+    def handle_api_error(err):
+        return jsonify({"error": err.message}), err.status_code
+
+    @app.before_request
+    def _require_permitted_host():
+        # Registered first so it runs before auth and CSRF: a rebound
+        # request is refused before it can learn anything about either.
+        if permitted_hosts is not None and _hostname(request.host) not in permitted_hosts:
+            raise ApiError(
+                f"Refused request for host {request.host!r}: this UI only answers requests "
+                "addressed to localhost/127.0.0.1/[::1] (DNS-rebinding protection). Open it "
+                "via http://127.0.0.1:<port>/, or pass --allow-host for a trusted proxy name.",
+                403,
+            )
+
+    @app.before_request
+    def _require_auth_token():
+        # Runs before the CSRF check: an unauthenticated caller should be
+        # turned away regardless of method, and should not learn anything
+        # about the CSRF contract. No-op when auth_token is unset.
+        if not _request_is_authenticated():
+            raise ApiError(
+                "Authentication required. Supply the token via the "
+                f"'{AUTH_HEADER}' header, the '{AUTH_COOKIE}' cookie, or a "
+                f"'?{AUTH_QUERY_PARAM}=' query parameter.",
+                401,
+            )
+
+    @app.after_request
+    def _persist_auth_cookie(response):
+        # When a valid token first arrives as a query parameter (a browser
+        # opening the UI), pin it as an httponly cookie so subsequent asset
+        # and API requests carry it without the token staying in the URL bar.
+        if auth_token and request.args.get(AUTH_QUERY_PARAM) and _request_is_authenticated():
+            response.set_cookie(
+                AUTH_COOKIE, auth_token, httponly=True, samesite="Strict", secure=request.is_secure
+            )
+        return response
+
+    @app.before_request
+    def _require_csrf_header_on_writes():
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.headers.get(CSRF_HEADER) != CSRF_HEADER_VALUE:
+            raise ApiError(
+                f"Missing or invalid {CSRF_HEADER} header - refused to prevent cross-site request forgery.",
+                403,
+            )
+
+    @app.errorhandler(413)
+    def handle_too_large(_err):
+        return jsonify({"error": f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."}), 413
+
+    # --- static frontend ---
+    # The UI is a single set of files (index.html, style.css, app.js) served
+    # by name, with no version in the URL. Without this, a browser caches
+    # them and keeps showing the OLD interface after an upgrade until the
+    # user does a hard refresh - a confusing "did it even update?" moment.
+    # `no-cache` makes the browser revalidate every time: it still gets a
+    # cheap 304 when nothing changed (send_from_directory sets ETag /
+    # Last-Modified), but the moment a file changes it fetches the new one.
+    def _serve_static(filename):
+        response = send_from_directory(STATIC_DIR, filename)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    @app.route("/")
+    def index():
+        return _serve_static("index.html")
+
+    @app.route("/<path:filename>")
+    def static_files(filename):
+        return _serve_static(filename)
+
+    # --- cases ---
+
+    @app.route("/api/cases")
+    def list_cases():
+        """Every case, with what someone choosing between them needs to see.
+
+        The bare case record answered "which cases exist" and nothing else,
+        so the home screen could not tell a finished investigation from an
+        empty one without opening each. Counts and the story's assessment
+        are included here.
+
+        `?brief=1` skips them. The case switcher only needs names, and it
+        renders on every page - opening every case store for it would make
+        each navigation pay for the home screen.
+
+        A case whose store cannot be read still appears, marked with the
+        error, rather than taking the whole list down with it.
+        """
+        cases = case_manager.list()
+        if request.args.get("brief"):
+            return jsonify([c.to_dict() for c in cases])
+
+        from trusttrace.core import narrative as narrative_module
+
+        rows = []
+        for case in cases:
+            data = case.to_dict()
+            data.update(
+                evidence_count=0,
+                event_count=0,
+                detection_count=0,
+                severity=None,
+                headline=None,
+                assessment=None,
+                summary_error=None,
+            )
+            try:
+                data["evidence_count"] = len(EvidenceManager(_case_dir(case)).list())
+                with locked_store(_case_dir(case)) as store:
+                    data["event_count"] = store.count_events()
+                    data["detection_count"] = store.count_detections()
+                    if data["event_count"]:
+                        story = narrative_module.build(store)
+                        data.update(
+                            severity=story.severity,
+                            headline=story.headline,
+                            assessment=story.assessment,
+                        )
+            except Exception as e:
+                app.logger.warning(f"Could not summarise {case.case_id}: {e}")
+                data["summary_error"] = str(e)
+            rows.append(data)
+        return jsonify(rows)
+
+    @app.route("/api/cases", methods=["POST"])
+    def create_case():
+        """Start an investigation from the browser.
+
+        This did not exist. The home screen of the web UI told a new user to
+        open a terminal and run `trusttrace case create`. The case is created
+        through CaseManager exactly as the CLI does, so the chain of custody
+        opens with the same case.created record whichever interface was used.
+        """
+        payload = request.get_json(force=True, silent=True) or {}
+        name = str(payload.get("name") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        investigator = str(payload.get("investigator") or "").strip()
+
+        if not name:
+            raise ApiError("A case needs a name.")
+        if len(name) > MAX_CASE_NAME:
+            raise ApiError(f"Case name is too long (max {MAX_CASE_NAME} characters).")
+        if len(description) > MAX_CASE_DESCRIPTION:
+            raise ApiError(f"Description is too long (max {MAX_CASE_DESCRIPTION} characters).")
+        if len(investigator) > MAX_INVESTIGATOR:
+            raise ApiError(f"Investigator name is too long (max {MAX_INVESTIGATOR} characters).")
+
+        from trusttrace.core.store import GLOBAL_WRITE_LOCK
+
+        # Serialized: case IDs are allocated by scanning the directory, so
+        # two creates at once could otherwise race for the same number.
+        with GLOBAL_WRITE_LOCK:
+            try:
+                case = case_manager.create(name, description=description, investigator=investigator or "unknown")
+            except CaseError as e:
+                raise ApiError(str(e))
+        return jsonify(case.to_dict()), 201
+
+    @app.route("/api/cases/<case_id>")
+    def get_case(case_id):
+        case = _load_case(case_id)
+        evidence_items = EvidenceManager(_case_dir(case)).list()
+        with locked_store(_case_dir(case)) as store:
+            event_count = store.count_events()
+            entity_count = store.count_entities()
+            detection_count = store.count_detections()
+            correlation_count = store.count_correlation_links()
+            correlation_by_type = store.count_correlation_links_by_type()
+            # A count that lands exactly on the budget means correlation
+            # stopped, not that the case holds precisely that many
+            # relationships. Displaying the round number as a finding is
+            # the kind of false precision a forensics tool must not print.
+            correlation_capped = correlation_count >= CORRELATION_MAX_PAIRS
+        finding_count = len(FindingManager(_case_dir(case)).list())
+
+        data = case.to_dict()
+        data.update(
+            evidence_count=len(evidence_items),
+            event_count=event_count,
+            entity_count=entity_count,
+            finding_count=finding_count,
+            detection_count=detection_count,
+            correlation_count=correlation_count,
+            correlation_capped=correlation_capped,
+            # Split as well as totalled: `related` (shared entity plus time
+            # proximity) and `possible_relationship` (proximity alone) are
+            # different strengths of claim, and a single number reads as
+            # though they were the same.
+            correlation_by_type=correlation_by_type,
+            artifact_count=len(case.artifacts),
+        )
+        return jsonify(data)
+
+    @app.route("/api/cases/<case_id>", methods=["DELETE"])
+    def delete_case(case_id):
+        """Delete a case and everything in it.
+
+        Requires the case ID echoed back in the body. That is not
+        ceremony: this removes the evidence copies, the store, the carved
+        artifacts AND the chain of custody, and a confirmation the caller
+        has to reproduce is what separates the case they meant from the
+        one that happened to be selected.
+        """
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        try:
+            summary = case_manager.delete(case.case_id, confirm_case_id=payload.get("confirm"))
+        except CaseError as e:
+            raise ApiError(str(e))
+        return jsonify(summary)
+
+    @app.route("/api/cases/<case_id>/status", methods=["POST"])
+    def set_case_status(case_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        status = (payload.get("status") or "").strip()
+        try:
+            updated = case_manager.update_status(case.case_id, status)
+        except CaseError as e:
+            raise ApiError(str(e))
+        return jsonify(updated.to_dict())
+
+    # --- evidence ---
+
+    @app.route("/api/cases/<case_id>/evidence")
+    def list_evidence(case_id):
+        case = _load_case(case_id)
+        items = EvidenceManager(_case_dir(case)).list()
+        return jsonify([e.to_dict() for e in items])
+
+    @app.route("/api/cases/<case_id>/evidence", methods=["POST"])
+    def upload_evidence(case_id):
+        case = _load_case(case_id)
+        if "file" not in request.files:
+            raise ApiError("No file provided (expected multipart field 'file').")
+        uploaded = request.files["file"]
+        filename = secure_filename(uploaded.filename or "")
+        if not filename:
+            raise ApiError("No file selected, or filename is invalid.")
+
+        staging_dir = Path(tempfile.mkdtemp(prefix="trusttrace_upload_"))
+        try:
+            staging_path = staging_dir / filename
+            uploaded.save(staging_path)
+
+            evidence_manager = EvidenceManager(_case_dir(case))
+            try:
+                evidence = evidence_manager.add(staging_path, case_id=case.case_id)
+            except EvidenceError as e:
+                raise ApiError(str(e))
+            case_manager.register_evidence(case.case_id, evidence.evidence_id)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        return jsonify(evidence.to_dict()), 201
+
+    # --- analyze (parse every evidence item + correlate, mirrors `trusttrace analyze`) ---
+
+    @app.route("/api/cases/<case_id>/analyze", methods=["POST"])
+    def analyze_case(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core.correlation import correlate_case
+        from trusttrace.core.detections import scan_case as scan_detections
+        from trusttrace.core.pipeline import parse_evidence_item
+
+        payload = request.get_json(force=True, silent=True) or {}
+        # Same knobs as `trusttrace analyze --engine ...`. Threaded
+        # through parse_evidence_item rather than applied here so a case
+        # analyzed from the web UI records the identical audit detail as
+        # one analyzed from the CLI.
+        parse_options = {
+            "engine": payload.get("engine") or None,
+            "display_filter": payload.get("display_filter") or None,
+        }
+
+        items = EvidenceManager(_case_dir(case)).list()
+        results = []
+        with locked_store(_case_dir(case)) as store:
+            for evidence in items:
+                event_count, entity_count, error = parse_evidence_item(
+                    evidence, _case_dir(case), case_manager, case.case_id, store, parse_options
+                )
+                results.append(
+                    {
+                        "evidence_id": evidence.evidence_id,
+                        "evidence_type": evidence.evidence_type,
+                        "event_count": event_count,
+                        "entity_count": entity_count,
+                        "error": error,
+                    }
+                )
+            correlate_case(store)
+            # Bundled detection rules: local, deterministic, zero-cost -
+            # runs automatically here just like correlation does, unlike
+            # ATT&CK mapping which stays behind an explicit scan action.
+            detections = scan_detections(store)
+            total_entities = store.count_entities()
+            total_events = store.count_events()
+
+        return jsonify(
+            {
+                "results": results,
+                "total_events": total_events,
+                "total_entities": total_entities,
+                "detection_count": len(detections),
+            }
+        )
+
+    # --- detections (read-only; recomputed automatically by /analyze) ---
+
+    @app.route("/api/cases/<case_id>/detections")
+    def list_detections(case_id):
+        case = _load_case(case_id)
+        severity = request.args.get("severity") or None
+        with locked_store(_case_dir(case)) as store:
+            detections = store.list_detections(severity=severity)
+        for d in detections:
+            d["detected_at"] = d["detected_at"].isoformat() if d["detected_at"] else None
+        return jsonify(detections)
+
+    # --- threat-intelligence indicators ---
+    #
+    # Imports go through core/ioc.import_into_case, the same function the
+    # CLI uses, so both leave an identical chain-of-custody record naming
+    # the feed by its SHA-256.
+
+    def _ioc_payload(store):
+        matched = {
+            d["detection_id"].removeprefix("DET-IOC-MATCH-"): d
+            for d in store.list_detections()
+            if d["rule_id"] == "IOC-MATCH"
+        }
+        indicators = []
+        for item in store.list_iocs():
+            hit = matched.get(item["ioc_id"])
+            item["added_at"] = item["added_at"].isoformat() if item["added_at"] else None
+            item["matched"] = hit is not None
+            item["match_event_id"] = hit["event_id"] if hit else None
+            item["match_description"] = hit["description"] if hit else None
+            indicators.append(item)
+        return {"indicators": indicators, "total": len(indicators), "matched": len(matched)}
+
+    @app.route("/api/cases/<case_id>/iocs")
+    def list_iocs(case_id):
+        case = _load_case(case_id)
+        with locked_store(_case_dir(case)) as store:
+            return jsonify(_ioc_payload(store))
+
+    @app.route("/api/cases/<case_id>/iocs", methods=["POST"])
+    def import_iocs(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import ioc
+
+        if "file" not in request.files:
+            raise ApiError("No file provided (expected multipart field 'file').")
+        uploaded = request.files["file"]
+        filename = secure_filename(uploaded.filename or "") or "feed.txt"
+        content = uploaded.read(ioc.MAX_FEED_BYTES + 1)
+        source = (request.form.get("source") or "").strip() or None
+
+        try:
+            with locked_store(_case_dir(case)) as store:
+                summary = ioc.import_into_case(store, _case_dir(case), content, filename, source=source)
+                payload = _ioc_payload(store)
+        except ioc.IocError as e:
+            raise ApiError(str(e))
+
+        for d in summary["matches"]:
+            d["detected_at"] = d["detected_at"].isoformat() if d["detected_at"] else None
+        summary["case"] = payload
+        return jsonify(summary), 201
+
+    @app.route("/api/cases/<case_id>/iocs", methods=["DELETE"])
+    def clear_iocs(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import ioc
+
+        payload = request.get_json(force=True, silent=True) or {}
+        source = (payload.get("source") or "").strip() or None
+        with locked_store(_case_dir(case)) as store:
+            removed = ioc.clear_from_case(store, _case_dir(case), source=source)
+        return jsonify({"removed": removed, "source": source})
+
+    # --- timeline ---
+
+    @app.route("/api/cases/<case_id>/timeline")
+    def get_timeline(case_id):
+        case = _load_case(case_id)
+        with locked_store(_case_dir(case)) as store:
+            entries = build_timeline(store)
+
+        time_from = parse_timestamp(request.args.get("from")) if request.args.get("from") else None
+        time_to = parse_timestamp(request.args.get("to")) if request.args.get("to") else None
+        entries = filter_timeline(
+            entries,
+            time_from=time_from,
+            time_to=time_to,
+            user=request.args.get("user"),
+            ip=request.args.get("ip"),
+            hostname=request.args.get("hostname"),
+            process=request.args.get("process"),
+            file=request.args.get("file"),
+            event_type=request.args.get("type"),
+            evidence_id=request.args.get("evidence"),
+        )
+        return jsonify([e.to_dict() for e in entries])
+
+    # --- entities ---
+
+    @app.route("/api/cases/<case_id>/entities")
+    def list_entities(case_id):
+        case = _load_case(case_id)
+        entity_type = request.args.get("type") or None
+        query = request.args.get("q", "").strip().lower()
+        with locked_store(_case_dir(case)) as store:
+            items = store.list_entities(entity_type=entity_type)
+            # Two aggregates for the whole case rather than a query per
+            # entity: ranking entities needs a count on every row, and the
+            # per-row alternative is thousands of round trips.
+            event_counts = store.entity_event_counts()
+            link_counts = store.entity_link_counts()
+        if query:
+            items = [e for e in items if query in e["value"].lower()]
+        for item in items:
+            item["event_count"] = event_counts.get(item["entity_id"], 0)
+            item["link_count"] = link_counts.get(item["entity_id"], 0)
+        if request.args.get("sort") == "events":
+            items.sort(key=lambda e: (e["event_count"], e["link_count"]), reverse=True)
+        # A dashboard panel showing six rows should not be sent eighteen
+        # thousand. Applied after sorting so `limit` means "the top N",
+        # not "an arbitrary N".
+        limit = request.args.get("limit")
+        if limit:
+            try:
+                items = items[: max(int(limit), 0)]
+            except ValueError:
+                raise ApiError("limit must be a number")
+        return jsonify(items)
+
+    @app.route("/api/cases/<case_id>/entities/<entity_id>/graph")
+    def entity_graph(case_id, entity_id):
+        case = _load_case(case_id)
+        with locked_store(_case_dir(case)) as store:
+            entity = store.get_entity(entity_id)
+            if entity is None:
+                raise ApiError(f"Entity not found: {entity_id}", 404)
+            related = store.related_entities(entity_id)
+        return jsonify({"entity": entity, "related": related})
+
+    @app.route("/api/cases/<case_id>/entities/<entity_id>/dossier")
+    def host_dossier(case_id, entity_id):
+        """Everything one host did, on one screen: its traffic totals, the
+        findings that fired on it, who it talked to, the services and
+        domains it reached, files seen with it, and any threat intel. Read
+        -only aggregation - host (IP) entities only."""
+        from trusttrace.core import host_dossier as dossier
+
+        case = _load_case(case_id)
+        with locked_store(_case_dir(case)) as store:
+            data = dossier.build(store, entity_id)
+        if data is None:
+            raise ApiError("No host found for that id (the dossier is for IP addresses).", 404)
+        return jsonify(data)
+
+    # --- investigate ---
+
+    @app.route("/api/cases/<case_id>/investigate")
+    def investigate(case_id):
+        case = _load_case(case_id)
+        entity_type = request.args.get("type")
+        value = request.args.get("value")
+        if not entity_type or not value:
+            raise ApiError("type and value query parameters are required")
+
+        with locked_store(_case_dir(case)) as store:
+            result = investigate_entity(store, entity_type, value)
+            if result is None:
+                raise ApiError(f"No evidence of {entity_type} '{value}' found in this case", 404)
+            return jsonify(
+                {
+                    "entity": result.entity,
+                    "evidence_ids": result.evidence_ids,
+                    "timeline": [e.to_dict() for e in result.timeline_entries],
+                    "related_entities": result.related_entities,
+                    "correlation_links": result.correlation_links,
+                    "leads": result.leads,
+                }
+            )
+
+    # --- threat intel (opt-in, explicit external call) ---
+
+    @app.route("/api/cases/<case_id>/threat-intel", methods=["POST"])
+    def check_threat_intel(case_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        entity_id = payload.get("entity_id")
+        entity_type = payload.get("entity_type")
+        value = payload.get("value")
+        if not all([entity_id, entity_type, value]):
+            raise ApiError("entity_id, entity_type, and value are required")
+
+        from trusttrace.core import threat_intel
+        from trusttrace.intel import virustotal
+
+        resolved_key = virustotal.get_api_key(payload.get("api_key"))
+        with locked_store(_case_dir(case)) as store:
+            result = threat_intel.check_entity(store, entity_id, entity_type, value, resolved_key)
+        if result is None:
+            raise ApiError(f"No threat intelligence source for entity type '{entity_type}'")
+        return jsonify(result)
+
+    # --- AI hypothesis (opt-in, explicit external call) ---
+
+    # --- settings (API keys / provider preferences) ---
+    # Keys are stored outside any case directory (see core/config.py) so
+    # they never ride along in a `case export` archive, and are never sent
+    # back to the browser in full - only "is it set" plus a masked hint.
+
+    @app.route("/api/settings")
+    def get_settings():
+        from trusttrace.core import config
+
+        return jsonify(config.masked_settings())
+
+    @app.route("/api/settings", methods=["POST"])
+    def update_settings():
+        from trusttrace.core import config
+
+        payload = request.get_json(force=True, silent=True) or {}
+        config.save_settings(payload)
+        return jsonify(config.masked_settings())
+
+    @app.route("/api/settings/test", methods=["POST"])
+    def test_settings():
+        """Verify a saved/entered credential actually works, rather than
+        leaving the investigator to find out mid-investigation. Makes one
+        real, minimal request to the named provider."""
+        payload = request.get_json(force=True, silent=True) or {}
+        target = payload.get("target")
+
+        if target == "virustotal":
+            from trusttrace.intel import virustotal
+
+            key = virustotal.get_api_key(payload.get("api_key"))
+            if not key:
+                return jsonify({"ok": False, "message": "No VirusTotal API key set."})
+            # 8.8.8.8 is a stable, uncontroversial lookup target - this is
+            # only checking that the credential is accepted.
+            result = virustotal.check_ip("8.8.8.8", key)
+            if result.get("error"):
+                return jsonify({"ok": False, "message": f"VirusTotal rejected the request: {result['error']}"})
+            return jsonify({"ok": True, "message": "VirusTotal key works."})
+
+        if target in ("anthropic", "openai", "gemini", "ollama"):
+            from trusttrace.core.ai_assistant import AssistantError, generate_hypothesis
+            from trusttrace.core.event import Event
+
+            probe = Event(
+                event_id="EVT-PROBE-0001",
+                evidence_id="EV-PROBE",
+                source="probe",
+                event_type="authentication",
+                message="Connectivity probe - not real evidence.",
+            )
+            try:
+                generate_hypothesis(
+                    [probe],
+                    provider=target,
+                    api_key=payload.get("api_key") or None,
+                    model=payload.get("model") or None,
+                    base_url=payload.get("base_url") or None,
+                )
+            except AssistantError as e:
+                return jsonify({"ok": False, "message": str(e)})
+            return jsonify({"ok": True, "message": f"{target} responded successfully."})
+
+        raise ApiError(f"Unknown test target '{target}'.")
+
+    @app.route("/api/glossary")
+    def glossary():
+        """Plain-language names for protocols and event types - see
+        core/explain.py. Static, so the UI fetches it once."""
+        from trusttrace.core import explain
+
+        return jsonify(explain.glossary())
+
+    @app.route("/api/ai/status")
+    def ai_status():
+        """How the AI assistant is set up: the current choice and whether it
+        is ready, whether local AI (Ollama) is running at the saved address
+        and which models it has, and which cloud providers have a key. Never
+        returns a key, and never probes an address taken from the request."""
+        from trusttrace.core import ai_setup
+
+        response = jsonify(ai_setup.status(refresh=bool(request.args.get("refresh"))))
+        response.headers["Cache-Control"] = "no-store"  # live state; never a stale copy
+        return response
+
+    @app.route("/api/ai-providers")
+    def list_ai_providers():
+        from trusttrace.core.ai_assistant import DEFAULT_MODELS, SUPPORTED_PROVIDERS
+
+        return jsonify({"providers": list(SUPPORTED_PROVIDERS), "default_models": DEFAULT_MODELS})
+
+    @app.route("/api/cases/<case_id>/ai-hypothesis", methods=["POST"])
+    def ai_hypothesis(case_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        entity_type = payload.get("entity_type")
+        value = payload.get("value")
+
+        if not entity_type or not value:
+            raise ApiError("entity_type and value are required")
+
+        from trusttrace.core.ai_assistant import AssistantError, generate_hypothesis, record_hypothesis_request
+
+        with locked_store(_case_dir(case)) as store:
+            result = investigate_entity(store, entity_type, value)
+            if result is None:
+                raise ApiError(f"No evidence of {entity_type} '{value}' found in this case", 404)
+            events = result.events
+
+        provider, model, base_url = _ai_settings(payload)
+
+        def _record(outcome, **extra):
+            record_hypothesis_request(
+                _case_dir(case),
+                provider=provider,
+                model=model,
+                entity_type=entity_type,
+                value=value,
+                events_sent=len(events),
+                outcome=outcome,
+                **extra,
+            )
+
+        try:
+            hypothesis = generate_hypothesis(
+                events,
+                provider=provider,
+                api_key=payload.get("api_key"),
+                model=model,
+                base_url=base_url,
+            )
+        except AssistantError as e:
+            _record("failed", error=str(e))
+            raise ApiError(str(e), 502)
+        _record(
+            "returned",
+            evidence_sufficient=hypothesis.evidence_sufficient,
+            confidence=hypothesis.confidence,
+            cited_events=[c.event_id for c in hypothesis.evidence],
+        )
+        return jsonify(hypothesis.model_dump())
+
+    @app.route("/api/cases/<case_id>/chat", methods=["POST"])
+    def ai_chat(case_id):
+        """Ask a question about the case, with the assistant retrieving
+        evidence through read-only tools.
+
+        Every claim is checked against what those tools actually returned;
+        an answer citing anything else is refused by core/chat.py and
+        surfaced here as an error rather than as an answer with a caveat.
+        A 502 is the right shape for that: the provider produced something
+        unusable, and there is no partial result worth showing.
+        """
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        question = (payload.get("question") or "").strip()
+        if not question:
+            raise ApiError("question is required")
+
+        from trusttrace.core import chat as chat_module
+
+        provider, model, base_url = _ai_settings(payload)
+        try:
+            result = chat_module.ask(
+                question,
+                _case_dir(case),
+                provider=provider,
+                api_key=payload.get("api_key"),
+                model=model,
+                base_url=base_url,
+                max_steps=int(payload.get("max_steps") or chat_module.MAX_STEPS),
+            )
+        except chat_module.ChatError as e:
+            chat_module.record_chat_request(_case_dir(case), question, provider, model, error=e)
+            raise ApiError(str(e), 502)
+        chat_module.record_chat_request(_case_dir(case), question, provider, model, result=result)
+        return jsonify(result.to_dict())
+
+    # --- investigation team ---
+    # A run takes minutes, so it goes on a background thread and the panel
+    # polls - see web/team_runs.py. Findings the team proposes are accepted
+    # one at a time by the investigator; nothing is written without that.
+
+    @app.route("/api/cases/<case_id>/team")
+    def team_status(case_id):
+        case = _load_case(case_id)
+        from trusttrace.agents import ROLES
+        from trusttrace.web import team_runs
+
+        body = team_runs.status(case.case_id, _case_dir(case))
+        body["available_roles"] = [{"slug": r.slug, "name": r.name} for r in ROLES.values()]
+        body["provider"], body["model"], _url = _ai_settings({})
+        return jsonify(body)
+
+    @app.route("/api/cases/<case_id>/team", methods=["POST"])
+    def team_start(case_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        import dataclasses
+
+        from trusttrace.agents import ROLES, resolve_roles
+        from trusttrace.web import team_runs
+
+        requested = payload.get("roles") or None
+        if isinstance(requested, str):
+            requested = [s.strip() for s in requested.split(",") if s.strip()]
+        try:
+            roles = resolve_roles(requested)
+        except KeyError as e:
+            raise ApiError(f"Unknown role {e}. Choose from: {', '.join(ROLES)}")
+        if payload.get("max_steps") not in (None, ""):
+            try:
+                steps = int(payload["max_steps"])
+            except (TypeError, ValueError):
+                raise ApiError("max_steps must be an integer")
+            if steps < 1:
+                raise ApiError("max_steps must be at least 1")
+            roles = [dataclasses.replace(role, max_steps=steps) for role in roles]
+
+        items = EvidenceManager(_case_dir(case)).list()
+        if not items:
+            raise ApiError("This case has no evidence for the team to investigate.")
+
+        provider, model, base_url = _ai_settings(payload)
+        try:
+            run = team_runs.start_run(
+                case.case_id,
+                _case_dir(case),
+                roles=roles,
+                # An explicit role list is run as asked; the default is scoped
+                # to the evidence present, exactly as the CLI does.
+                evidence_types=None if requested else {item.evidence_type for item in items},
+                provider=provider,
+                api_key=payload.get("api_key") or None,
+                model=model,
+                base_url=base_url,
+                actor=payload.get("investigator") or "web-ui",
+            )
+        except team_runs.TeamRunError as e:
+            raise ApiError(str(e), 409)
+        return jsonify(run.snapshot()), 202
+
+    @app.route("/api/cases/<case_id>/team/findings/<int:index>/accept", methods=["POST"])
+    def team_accept(case_id, index):
+        """Record one proposed team finding as an Open investigator finding."""
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        from trusttrace.agents.records import save_merged_finding
+        from trusttrace.core.finding import FindingError
+        from trusttrace.web import team_runs
+
+        run = team_runs.get_run(case.case_id)
+        if run is not None and run.state == "running":
+            raise ApiError("Wait for the current team run to finish before accepting findings.", 409)
+        latest = team_runs.load_latest(_case_dir(case))
+        findings = (latest or {}).get("findings") or []
+        if not 0 <= index < len(findings):
+            raise ApiError("No such team finding - run the team again.", 404)
+        accepted = latest.setdefault("accepted", {})
+        if str(index) in accepted:
+            raise ApiError(f"Already accepted as {accepted[str(index)]}.", 409)
+
+        try:
+            with locked_store(_case_dir(case)) as store:
+                # Validate event citations against the case as it is now: the
+                # evidence may have been re-analyzed since the run.
+                for citation in findings[index].get("citations") or []:
+                    if citation.get("kind") == "event" and store.get_event(str(citation.get("reference"))) is None:
+                        raise ApiError(
+                            f"Event {citation.get('reference')} no longer exists in this case - run the team again.",
+                            409,
+                        )
+            finding = save_merged_finding(
+                _case_dir(case), case.case_id, case_manager, findings[index], payload.get("investigator") or "web-ui"
+            )
+        except FindingError as e:
+            raise ApiError(str(e))
+
+        accepted[str(index)] = finding.finding_id
+        team_runs.save_latest(_case_dir(case), latest)
+        return jsonify(finding.to_dict()), 201
+
+    # --- findings ---
+    # Creating/updating a finding remains an explicit, investigator-owned
+    # action (see core/finding.py's module docstring) - the web UI is a
+    # second way to perform that same action, not a second implementation
+    # of it. Both routes call straight into FindingManager, exactly like
+    # `trusttrace finding create/update` do.
+
+    @app.route("/api/cases/<case_id>/findings")
+    def list_findings(case_id):
+        case = _load_case(case_id)
+        findings = FindingManager(_case_dir(case)).list()
+        return jsonify([f.to_dict() for f in findings])
+
+    @app.route("/api/cases/<case_id>/findings", methods=["POST"])
+    def create_finding(case_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        title = (payload.get("title") or "").strip()
+        if not title:
+            raise ApiError("title is required")
+
+        event_ids = payload.get("event_ids") or []
+        evidence_refs = []
+        with locked_store(_case_dir(case)) as store:
+            valid_event_ids = {e.event_id for e in store.all_events()}
+            for event_id in event_ids:
+                event = store.get_event(event_id)
+                if event is None:
+                    raise ApiError(f"event_id '{event_id}' not found in {case.case_id}.")
+                evidence_refs.append({"evidence_id": event.evidence_id, "event_id": event.event_id})
+
+        from trusttrace.core.finding import FindingError
+
+        finding_manager = FindingManager(_case_dir(case))
+        try:
+            finding = finding_manager.create(
+                case_id=case.case_id,
+                title=title,
+                created_by=payload.get("investigator") or "web-ui",
+                severity=payload.get("severity") or "Medium",
+                status=payload.get("status") or "Open",
+                assessment=payload.get("assessment") or "",
+                evidence_refs=evidence_refs,
+                valid_event_ids=valid_event_ids,
+            )
+        except FindingError as e:
+            raise ApiError(str(e))
+
+        case_manager.register_finding(case.case_id, finding.finding_id)
+        return jsonify(finding.to_dict()), 201
+
+    @app.route("/api/cases/<case_id>/findings/<finding_id>", methods=["POST"])
+    def update_finding(case_id, finding_id):
+        case = _load_case(case_id)
+        payload = request.get_json(force=True, silent=True) or {}
+        status = payload.get("status")
+        note = payload.get("note")
+        if not status and not note:
+            raise ApiError("status and/or note is required")
+
+        from trusttrace.core.finding import FindingError
+
+        finding_manager = FindingManager(_case_dir(case))
+        try:
+            finding = None
+            if status:
+                finding = finding_manager.update_status(finding_id, status)
+            if note:
+                finding = finding_manager.add_note(finding_id, note, payload.get("investigator") or "web-ui")
+        except FindingError as e:
+            raise ApiError(str(e), 404 if "not found" in str(e).lower() else 400)
+
+        return jsonify(finding.to_dict())
+
+    # --- ATT&CK technique mappings (read-only; run/validate via the CLI) ---
+
+    @app.route("/api/cases/<case_id>/attack")
+    def list_attack_techniques(case_id):
+        case = _load_case(case_id)
+        with locked_store(_case_dir(case)) as store:
+            techniques = store.list_techniques()
+        for t in techniques:
+            t["created_at"] = t["created_at"].isoformat() if t["created_at"] else None
+            t["updated_at"] = t["updated_at"].isoformat() if t["updated_at"] else None
+        return jsonify(techniques)
+
+    # --- chain of custody (read-only; append-only by construction) ---
+
+    @app.route("/api/cases/<case_id>/audit")
+    def get_audit_log(case_id):
+        from trusttrace.core import audit
+
+        case = _load_case(case_id)
+        case_dir = _case_dir(case)
+        intact, problems = audit.verify(case_dir)
+        return jsonify(
+            {"intact": intact, "problems": problems, "entries": audit.read_entries(case_dir)}
+        )
+
+    # --- reports ---
+
+    @app.route("/api/cases/<case_id>/report/<fmt>")
+    def get_report(case_id, fmt):
+        case = _load_case(case_id)
+        fmt = fmt.lower()
+        if fmt not in RENDERERS:
+            raise ApiError(f"Unsupported format '{fmt}'. Choose from: {', '.join(RENDERERS)}")
+        report = build_report(case, _case_dir(case))
+        content = RENDERERS[fmt](report)
+        return app.response_class(content, mimetype=REPORT_MIMETYPES[fmt])
+
+    # --- live capture ---
+    # Polled by the frontend rather than streamed (SSE): a persistent
+    # streaming connection would need a threaded server, which conflicts
+    # with keeping DuckDB access serialized through one global lock - see
+    # the module docstring. ~1.5s polling is plenty responsive for this.
+
+    @app.route("/api/interfaces")
+    def api_list_interfaces():
+        from trusttrace.core import capture as capture_module
+
+        try:
+            return jsonify(capture_module.list_interfaces())
+        except Exception as e:
+            raise ApiError(f"Could not list network interfaces: {e}", 500)
+
+    @app.route("/api/cases/<case_id>/capture/status")
+    def capture_status(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import capture as capture_module
+
+        session = capture_module.get_session(case.case_id)
+        if session is None:
+            return jsonify({"running": False})
+        return jsonify(session.snapshot())
+
+    @app.route("/api/cases/<case_id>/capture/start", methods=["POST"])
+    def capture_start(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import capture as capture_module
+
+        payload = request.get_json(force=True, silent=True) or {}
+        rotate_seconds = payload.get("rotate_seconds") or capture_module.DEFAULT_ROTATE_SECONDS
+        try:
+            rotate_seconds = int(rotate_seconds)
+        except (TypeError, ValueError):
+            raise ApiError("rotate_seconds must be an integer")
+
+        try:
+            capture_module.start_capture(
+                case.case_id,
+                _case_dir(case),
+                case_manager,
+                interface=payload.get("interface") or None,
+                bpf_filter=payload.get("filter") or None,
+                rotate_seconds=rotate_seconds,
+                engine=payload.get("engine") or None,
+            )
+        except capture_module.CaptureError as e:
+            status = 409 if "already running" in str(e) else 400
+            raise ApiError(str(e), status)
+        return jsonify({"started": True})
+
+    @app.route("/api/cases/<case_id>/capture/stop", methods=["POST"])
+    def capture_stop(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import capture as capture_module
+
+        try:
+            capture_module.stop_capture(case.case_id)
+        except capture_module.CaptureError as e:
+            raise ApiError(str(e), 404)
+        return jsonify({"stopped": True})
+
+    @app.route("/api/cases/<case_id>/narrative")
+    def case_narrative(case_id):
+        """The case as an account of what happened, not a count of objects."""
+        case = _load_case(case_id)
+        from trusttrace.core import narrative as narrative_module
+
+        with locked_store(_case_dir(case)) as store:
+            narrative = narrative_module.build(store)
+        return jsonify(narrative.to_dict())
+
+    # --- dig: content search, stream reassembly, triage ---
+    #
+    # These wrap core/search.py, core/streams.py and core/ctf.py, which
+    # until now were reachable only from the CLI. All three are READ-ONLY
+    # questions asked of a capture file: none of them touches the store,
+    # writes an artifact, or creates a finding. That is why they are plain
+    # GET/POST reads with no audit entry - recording that someone looked
+    # at evidence is not what the chain of custody is for.
+
+    def _capture_path(case, evidence_id):
+        """Resolve a pcap evidence item to its stored copy.
+
+        Always the stored copy, never the path it was added from: that is
+        the one that was hashed into the chain of custody.
+        """
+        manager = EvidenceManager(_case_dir(case))
+        captures = [item for item in manager.list() if item.evidence_type == "pcap"]
+        if not captures:
+            raise ApiError("This case has no capture evidence.", 404)
+        if evidence_id:
+            for item in captures:
+                if item.evidence_id == evidence_id:
+                    return item, manager.stored_file_path(item.evidence_id)
+            raise ApiError(f"No capture evidence {evidence_id} in this case.", 404)
+        return captures[0], manager.stored_file_path(captures[0].evidence_id)
+
+    @app.route("/api/cases/<case_id>/search", methods=["POST"])
+    def search_case(case_id):
+        """Content search over a capture's raw bytes."""
+        case = _load_case(case_id)
+        from trusttrace.core import search as search_module
+
+        payload = request.get_json(force=True, silent=True) or {}
+        pattern = (payload.get("pattern") or "").strip()
+        if not pattern:
+            raise ApiError("pattern is required")
+
+        evidence, path = _capture_path(case, payload.get("evidence_id"))
+        try:
+            result = search_module.search_capture(
+                path,
+                pattern,
+                mode=payload.get("mode") or search_module.TEXT,
+                case_sensitive=bool(payload.get("case_sensitive")),
+                max_hits=int(payload.get("max_hits") or search_module.DEFAULT_MAX_HITS),
+                display_filter=payload.get("display_filter") or None,
+            )
+        except search_module.SearchError as e:
+            # A bad pattern or a missing tshark is the caller's problem to
+            # fix, not a server fault - 400 rather than 500.
+            raise ApiError(str(e))
+
+        data = result.to_dict()
+        data["evidence_id"] = evidence.evidence_id
+        return jsonify(data)
+
+    @app.route("/api/cases/<case_id>/streams")
+    def list_case_streams(case_id):
+        case = _load_case(case_id)
+        from trusttrace.core import streams as streams_module
+
+        evidence, path = _capture_path(case, request.args.get("evidence"))
+        try:
+            found = streams_module.list_streams(
+                path,
+                protocol=request.args.get("protocol") or streams_module.TCP,
+                display_filter=request.args.get("filter") or None,
+                limit=int(request.args.get("limit") or streams_module.DEFAULT_STREAM_LIMIT),
+            )
+        except streams_module.StreamError as e:
+            raise ApiError(str(e))
+        from trusttrace.core import explain
+
+        rows = []
+        for summary in found:
+            row = summary.to_dict()
+            # Plain words first, for someone new; the fields above stay for
+            # everyone who wants the Wireshark view.
+            row["plain"] = explain.describe_stream(summary)
+            rows.append(row)
+        return jsonify({"evidence_id": evidence.evidence_id, "streams": rows})
+
+    @app.route("/api/cases/<case_id>/streams/<int:index>")
+    def follow_case_stream(case_id, index):
+        case = _load_case(case_id)
+        from trusttrace.core import streams as streams_module
+
+        evidence, path = _capture_path(case, request.args.get("evidence"))
+        try:
+            followed = streams_module.follow_stream(
+                path,
+                protocol=request.args.get("protocol") or streams_module.TCP,
+                index=index,
+                max_bytes=int(request.args.get("max_bytes") or streams_module.DEFAULT_MAX_BYTES),
+            )
+        except streams_module.StreamError as e:
+            raise ApiError(str(e), 404)
+        data = followed.to_dict()
+        data["evidence_id"] = evidence.evidence_id
+        # Leads about what the conversation carried (email addresses, a
+        # password field, a private key) - the same hints recovered files get.
+        from trusttrace.core.artifacts import _content_notes
+
+        text = "\n".join(turn.text for turn in followed.turns)[:65536].encode("utf-8", errors="replace")
+        data["hints"] = _content_notes(text, "text")
+        return jsonify(data)
+
+    @app.route("/api/cases/<case_id>/streams/<int:index>/data")
+    def stream_data(case_id, index):
+        """Save what one side of a conversation sent, byte for byte - the way
+        to get a file out of any protocol the automatic recovery does not
+        cover. `direction=a` is what the first endpoint sent, `b` the reply.
+        Recorded in the chain of custody, like a recovered-file download."""
+        case = _load_case(case_id)
+        from io import BytesIO
+
+        from flask import send_file
+
+        from trusttrace.core import audit
+        from trusttrace.core import streams as streams_module
+
+        direction = request.args.get("direction", "a")
+        if direction not in ("a", "b"):
+            raise ApiError("direction must be 'a' or 'b'.")
+        protocol = request.args.get("protocol") or streams_module.TCP
+        evidence, path = _capture_path(case, request.args.get("evidence"))
+        try:
+            payload = streams_module.stream_bytes(path, protocol=protocol, index=index)
+        except streams_module.StreamError as e:
+            raise ApiError(str(e), 404)
+        data = payload.a_to_b if direction == "a" else payload.b_to_a
+        if not data:
+            raise ApiError("That side of the conversation sent no data.", 404)
+
+        import hashlib
+
+        audit.record(
+            _case_dir(case),
+            audit.STREAM_EXPORTED,
+            {
+                "evidence_id": evidence.evidence_id,
+                "protocol": protocol,
+                "stream": index,
+                "direction": direction,
+                "sender": payload.node_a if direction == "a" else payload.node_b,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            },
+        )
+        name = f"{evidence.evidence_id}-{protocol}-stream{index}-{direction}.bin"
+        return _harden(
+            send_file(BytesIO(data), mimetype="application/octet-stream", as_attachment=True, download_name=name)
+        )
+
+    @app.route("/api/cases/<case_id>/triage")
+    def triage_case(case_id):
+        """Run the triage presets over a capture.
+
+        Deliberately does NOT extract files: object export writes to disk,
+        and a GET that a dashboard polls must not have that side effect.
+        Recovered files are still reported (name, size, hash) - saving
+        them stays the explicit `--extract-to` action on the CLI.
+        """
+        case = _load_case(case_id)
+        from trusttrace.core import ctf as ctf_module
+
+        evidence, path = _capture_path(case, request.args.get("evidence"))
+        try:
+            report = ctf_module.triage(
+                path,
+                max_hits=int(request.args.get("max_hits") or ctf_module.DEFAULT_MAX_HITS_PER_CATEGORY),
+                display_filter=request.args.get("filter") or None,
+                output_dir=None,
+            )
+        except ctf_module.CtfError as e:
+            raise ApiError(str(e))
+        data = report.to_dict()
+        data["evidence_id"] = evidence.evidence_id
+        return jsonify(data)
+
+    @app.route("/api/cases/<case_id>/artifacts")
+    def list_artifacts(case_id):
+        """Files recovered from evidence: what each really is (by content,
+        not name), how risky it is to open, and where it came from. A file
+        registered but since removed is listed as missing, not hidden - see
+        core/artifacts.py."""
+        case = _load_case(case_id)
+        from trusttrace.core import artifacts as artifacts_module
+
+        with locked_store(_case_dir(case)) as store:
+            return jsonify(artifacts_module.describe_all(_case_dir(case), case, store))
+
+    def _artifact_path(case):
+        from trusttrace.core import artifacts as artifacts_module
+
+        try:
+            return artifacts_module.resolve(_case_dir(case), case, request.args.get("path"))
+        except artifacts_module.ArtifactError as e:
+            raise ApiError(str(e), 404)
+
+    def _harden(response):
+        # A recovered file is attacker-controlled bytes. nosniff stops the
+        # browser second-guessing the declared type, and a sandboxing CSP
+        # means that even if one were ever rendered it could run nothing.
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; img-src 'self'; sandbox"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/cases/<case_id>/artifacts/preview")
+    def preview_artifact(case_id):
+        """A safe look at a recovered file: text, a CSV table, a raster image,
+        or a hex dump. Never HTML - see core/artifacts.preview()."""
+        case = _load_case(case_id)
+        from trusttrace.core import artifacts as artifacts_module
+
+        return jsonify(artifacts_module.preview(_artifact_path(case)))
+
+    @app.route("/api/cases/<case_id>/artifacts/content")
+    def artifact_content(case_id):
+        """The file itself. Always a download (octet-stream, attachment),
+        except `?inline=1` for formats that cannot carry script (PNG, JPEG,
+        GIF, WebP), which the preview shows as an image.
+
+        A download takes a copy of evidence out of the case, so it is
+        recorded in the chain of custody; an inline image preview is not.
+        """
+        case = _load_case(case_id)
+        from flask import send_file
+
+        from trusttrace.core import artifacts as artifacts_module
+        from trusttrace.core import audit
+
+        path = _artifact_path(case)
+        identity = artifacts_module.identify(path)
+        if request.args.get("inline"):
+            if identity["kind"] not in artifacts_module.SAFE_IMAGE_MIME:
+                raise ApiError("Only PNG, JPEG, GIF and WebP images can be shown inline.", 400)
+            return _harden(send_file(path, mimetype=identity["mime"]))
+
+        audit.record(
+            _case_dir(case),
+            audit.ARTIFACT_EXPORTED,
+            {
+                "path": request.args.get("path"),
+                "sha256": artifacts_module.sha256_of(path),
+                "size": path.stat().st_size,
+                "type": identity["label"],
+            },
+        )
+        return _harden(
+            send_file(path, mimetype="application/octet-stream", as_attachment=True, download_name=path.name)
+        )
+
+    # --- Wireshark integration ---
+    #
+    # The GUI pivot is deliberately NOT a "launch Wireshark" endpoint. The
+    # web UI is served over HTTP and a browser page must not be able to
+    # spawn a desktop application on the machine running the server - that
+    # is a remote-process-launch primitive, and the fact that this server
+    # is normally bound to localhost is a deployment detail, not a
+    # guarantee. So this returns the display filter and the exact command,
+    # and the analyst runs it (or uses `trusttrace wireshark open`, where
+    # the intent to launch is unambiguous because they typed it).
+
+    @app.route("/api/wireshark/status")
+    def wireshark_status():
+        from trusttrace.integrations import wireshark
+        from trusttrace.parsers import pcap_engine
+
+        info = wireshark.status()
+        info["parse_engine"] = pcap_engine.engine_status()
+        return jsonify(info)
+
+    @app.route("/api/wireshark/check-filter", methods=["POST"])
+    def wireshark_check_filter():
+        from trusttrace.integrations import wireshark
+
+        payload = request.get_json(force=True, silent=True) or {}
+        display_filter = (payload.get("display_filter") or "").strip()
+        if not display_filter:
+            raise ApiError("display_filter is required.")
+        valid, error = wireshark.validate_display_filter(display_filter)
+        return jsonify({"valid": valid, "error": error})
+
+    @app.route("/api/cases/<case_id>/events/<event_id>/wireshark")
+    def wireshark_pivot(case_id, event_id):
+        """The display filter and command that isolate one event's packets."""
+        case = _load_case(case_id)
+        from trusttrace.integrations import wireshark
+
+        with locked_store(_case_dir(case)) as store:
+            event = store.get_event(event_id)
+        if event is None:
+            raise ApiError(f"No event {event_id} in {case.case_id}.", 404)
+
+        evidence_manager = EvidenceManager(_case_dir(case))
+        try:
+            evidence = evidence_manager.load(event.evidence_id)
+        except EvidenceError as e:
+            raise ApiError(str(e), 404)
+        if evidence.evidence_type != "pcap":
+            raise ApiError(
+                f"{event_id} came from {evidence.evidence_type} evidence, which has no packets to open.",
+                400,
+            )
+
+        stored_path = evidence_manager.stored_file_path(evidence.evidence_id)
+        display_filter = wireshark.filter_for_event(event)
+        return jsonify(
+            {
+                "event_id": event_id,
+                "evidence_id": evidence.evidence_id,
+                "display_filter": display_filter,
+                "command": wireshark.gui_command(stored_path, display_filter),
+                "gui_available": wireshark.gui_path() is not None,
+            }
+        )
+
+    @app.route("/api/cases/<case_id>/evidence/<evidence_id>/slice", methods=["POST"])
+    def wireshark_slice(case_id, evidence_id):
+        """Carve the packets matching a display filter into a new, hashed
+        evidence item.
+
+        Adding the slice back as evidence rather than streaming it to the
+        browser is the point: a filtered view someone screenshotted is not
+        reproducible, and a hashed capture recorded against its parent
+        filter is.
+        """
+        case = _load_case(case_id)
+        from trusttrace.core import audit
+        from trusttrace.integrations import wireshark
+
+        payload = request.get_json(force=True, silent=True) or {}
+        display_filter = (payload.get("display_filter") or "").strip()
+        if not display_filter:
+            raise ApiError("display_filter is required.")
+
+        evidence_manager = EvidenceManager(_case_dir(case))
+        try:
+            evidence = evidence_manager.load(evidence_id)
+        except EvidenceError as e:
+            raise ApiError(str(e), 404)
+        if evidence.evidence_type != "pcap":
+            raise ApiError(f"{evidence_id} is {evidence.evidence_type} evidence, not a capture file.")
+
+        stored_path = evidence_manager.stored_file_path(evidence.evidence_id)
+        staging_dir = Path(tempfile.mkdtemp(prefix="trusttrace_slice_"))
+        try:
+            try:
+                slice_path, packet_count = wireshark.extract_slice(
+                    stored_path, display_filter, staging_dir / f"{evidence.evidence_id}-slice.pcap"
+                )
+            except wireshark.WiresharkError as e:
+                raise ApiError(str(e))
+
+            if packet_count == 0:
+                # A valid answer to the filter, but adding an empty capture
+                # to the chain of custody would imply something was found.
+                return jsonify({"packet_count": 0, "evidence_id": None, "display_filter": display_filter})
+
+            try:
+                new_evidence = evidence_manager.add(slice_path, case_id=case.case_id)
+            except EvidenceError as e:
+                raise ApiError(str(e))
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        case_manager.register_evidence(case.case_id, new_evidence.evidence_id)
+        audit.record(
+            _case_dir(case),
+            audit.EVIDENCE_SLICED,
+            {
+                "evidence_id": new_evidence.evidence_id,
+                "derived_from": evidence.evidence_id,
+                "display_filter": display_filter,
+                "packet_count": packet_count,
+            },
+        )
+        return jsonify(
+            {
+                "packet_count": packet_count,
+                "evidence_id": new_evidence.evidence_id,
+                "display_filter": display_filter,
+            }
+        ), 201
+
+    return app
+

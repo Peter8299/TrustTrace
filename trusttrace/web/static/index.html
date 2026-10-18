@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>TrustTrace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- First stop for keyboard users: past the rail straight to the page.
+       Handled in app.js - following "#app" as a link would be a route. -->
+  <a class="skip-link" href="#app" id="skip-link">Skip to main content</a>
+  <div class="shell">
+
+    <!-- Left rail. Grouped by the stage of an investigation rather than
+         listed flat: fourteen equal destinations say nothing about what
+         belongs together, and a vertical rail has the room to say it -
+         which a horizontal bar did not, having pushed its last tab off
+         the right edge at 1440px. -->
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#5b9dff" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M12 2l8 3.5v6c0 4.6-3.2 8.5-8 10.5-4.8-2-8-5.9-8-10.5v-6z"/>
+          <path d="M9 12l2 2 4-4" stroke-linecap="round"/>
+        </svg>
+        <span class="brand-text">
+          <span class="brand-name">TrustTrace</span>
+          <span class="brand-sub">Local-first DFIR platform</span>
+        </span>
+      </a>
+
+      <nav id="case-nav" class="rail" hidden></nav>
+
+      <div class="rail-foot">
+        <div id="capture-card"></div>
+        <div class="local-mode">
+          <span class="dot ok"></span>
+          <div>
+            <div>Local mode</div>
+            <div class="muted">No data leaves your machine</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div id="case-switch" class="case-switch"></div>
+        <a class="settings-link" href="#/settings">Settings</a>
+      </header>
+
+      <main id="app" tabindex="-1"></main>
+
+      <footer class="statusbar" id="statusbar"></footer>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <!-- Screen readers hear what the toast says through these, which stay in
+       the page (a live region that is itself shown and hidden is not
+       reliably announced). Errors interrupt; everything else waits. -->
+  <div id="announce-polite" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="announce-urgent" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

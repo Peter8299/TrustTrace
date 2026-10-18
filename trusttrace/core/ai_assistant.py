@@ -1,0 +1,623 @@
+"""AI investigation assistant: an optional, explicitly-invoked layer that
+proposes AT MOST ONE hedged hypothesis from a set of investigator-selected
+events, via a choice of AI providers (Anthropic, OpenAI, a local Ollama
+server, or Google Gemini).
+
+This sits downstream of the deterministic pipeline (parsing ->
+normalization -> correlation -> timeline -> entity extraction) and never
+replaces it:
+
+    Evidence -> Parsing -> Normalization -> Correlation -> Timeline
+        -> Evidence selection -> AI analysis -> Hypothesis
+        -> Human validation
+
+Safety rules, enforced in code here rather than left to the prompt alone -
+identically, regardless of which provider answered:
+  - never runs automatically during parse/analyze/investigate - only on an
+    explicit investigator action (`trusttrace investigate --ai`)
+  - only normalized Event data is sent to the provider - never raw
+    evidence file contents, and only the events the investigator's query
+    selected
+  - every provider is held to the same Hypothesis JSON schema; the
+    response is validated by pydantic AND every cited (evidence_id,
+    event_id) pair is checked against the events actually given to it
+    after the response comes back - in one central code path each
+    provider's raw response dict passes through, not duplicated per
+    provider. A hypothesis citing anything not present is REJECTED
+    outright, never silently trusted or displayed, no matter which
+    provider produced it.
+  - output always distinguishes observed evidence from interpretation,
+    always carries a confidence level, and always includes an alternative
+    explanation - the schema makes omitting any of these impossible
+  - nothing here writes a Finding; the investigator decides whether to
+    act on a hypothesis via `trusttrace finding create`
+
+Each provider is optional and independently installable (see pyproject.toml's
+ai/ai-openai/ai-gemini extras); Ollama needs no extra package at all since
+it's a local HTTP call via `requests` (already required by the base `ai`
+extra). Picking a provider that isn't installed raises AssistantError with
+a clear message rather than an ImportError leaking out of this module.
+"""
+
+import logging
+import os
+from typing import List, Literal
+
+from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_PROVIDERS = ("anthropic", "openai", "ollama", "gemini")
+
+# Sane defaults, not the only option - every entry point (CLI --model,
+# the web API's "model" field) lets the investigator override these.
+#
+# The Gemini entry is pinned rather than using the gemini-flash-latest
+# alias, which is the opposite of the obvious choice and was settled by
+# testing both against the live API. A pinned model eventually retires
+# (gemini-2.0-flash, the previous default, now 404s) - but the API's
+# retirement error names its replacement, so the failure is loud and
+# actionable once. The rolling alias never retires but tracks whichever
+# model is newest and therefore most contended: it was returning "this
+# model is currently experiencing high demand" while the pinned model
+# answered in 8 seconds. A default that intermittently fails is worse
+# than one that fails once, clearly, years from now.
+DEFAULT_MODELS = {
+    "anthropic": "claude-opus-5-5",
+    "openai": "gpt-4o-mini",
+    "ollama": "llama3.1",
+    "gemini": "gemini-3.6-flash",
+}
+
+# Substrings marking a failure that is worth retrying: provider capacity
+# and rate limiting, not bad credentials or a malformed request. Matched
+# against the message text because each SDK signals these differently and
+# this module deliberately does not depend on provider-specific classes.
+_TRANSIENT_MARKERS = (
+    "high demand",
+    "overloaded",
+    "rate limit",
+    "too many requests",
+    "temporarily unavailable",
+    "try again",
+    "503",
+    "429",
+)
+MAX_TRANSIENT_RETRIES = 2
+RETRY_BACKOFF_SECONDS = 2.0
+
+MAX_TOKENS = 4096
+# Current Claude models always think before answering, and the thinking
+# counts against max_tokens - at 4096 a long case summary could use it all
+# and leave the JSON answer cut off.
+ANTHROPIC_MAX_TOKENS = 16000
+MAX_EVENTS = 50
+# 127.0.0.1, not "localhost": Ollama listens on IPv4 loopback only, and on
+# Windows "localhost" tries IPv6 ::1 first and takes ~2 s to give up on it -
+# added to every single request to a local model.
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+
+SYSTEM_PROMPT = """You are assisting a digital forensics and incident response (DFIR) investigator.
+You will be given a set of normalized forensic events, already parsed and extracted from real evidence.
+
+Your job is to propose AT MOST ONE hypothesis about what these events might represent. You must:
+- Base every claim ONLY on the events provided below. Never reference an evidence_id or event_id that
+  was not given to you - doing so makes your entire response unusable and it will be discarded.
+- Clearly separate observed fact (what literally happened, per the events) from your interpretation.
+- Phrase the hypothesis as a possibility ("may represent", "could indicate"), never as a certainty.
+- Always provide at least one plausible alternative, non-malicious explanation for the same evidence.
+- Assign a confidence level (low/medium/high) that reflects how strong the evidence actually is, not
+  how interesting the hypothesis is.
+- If the provided events do not support any reasonable hypothesis, say so explicitly by setting
+  evidence_sufficient to false rather than inventing one.
+
+You are not the investigator. Your output is a starting point for the investigator's own review, never
+a conclusion they should accept without checking it themselves."""
+
+
+class EvidenceCitation(BaseModel):
+    evidence_id: str
+    event_id: str
+
+
+class Hypothesis(BaseModel):
+    evidence_sufficient: bool
+    claim: str
+    assessment: str
+    observed_evidence: List[str]
+    confidence: Literal["low", "medium", "high"]
+    alternative_explanation: str
+    recommended_validation: str
+    evidence: List[EvidenceCitation]
+
+
+class AssistantError(Exception):
+    """Raised when the assistant can't produce a usable hypothesis: no
+    credentials, an API failure, or a response citing evidence not
+    actually present in the given events. The last case is a hard
+    rejection, not a warning - this module never returns a hypothesis it
+    can't verify."""
+
+
+def _event_summary(event):
+    """A compact, plain-text line for one event - the only thing that
+    actually gets sent to the model. Normalized fields only, never the
+    raw evidence file."""
+    fields = [event.event_type]
+    if event.timestamp:
+        fields.insert(0, str(event.timestamp))
+    for label, value in (
+        ("user", event.user),
+        ("hostname", event.hostname),
+        ("src_ip", event.src_ip),
+        ("dst_ip", event.dst_ip),
+        ("dst_port", event.dst_port),
+        ("process", event.process_name),
+        ("command_line", event.command_line),
+        ("file", event.file_name),
+        ("file_hash", event.file_hash),
+        ("domain", event.domain),
+        ("message", event.message),
+    ):
+        if value:
+            fields.append(f"{label}={value}")
+    return f"[{event.evidence_id}/{event.event_id}] " + " ".join(fields)
+
+
+#: Set TRUSTTRACE_OLLAMA_ALLOW_REMOTE=1 to permit a non-loopback Ollama host.
+OLLAMA_ALLOW_REMOTE_ENV = "TRUSTTRACE_OLLAMA_ALLOW_REMOTE"
+
+
+def _validate_ollama_base_url(base_url):
+    """Reject an Ollama base URL that isn't a safe local target.
+
+    Guards against server-side request forgery: base_url originates from a
+    web request, so without this an unauthenticated caller could drive the
+    server into POSTing to an arbitrary internal host. Ollama runs locally,
+    so loopback is allowed; a remote host must be opted into explicitly via
+    OLLAMA_ALLOW_REMOTE_ENV, which is a deliberate operator choice.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url or "")
+    if parsed.scheme not in ("http", "https"):
+        raise AssistantError(
+            f"Ollama base URL must use http or https, not '{parsed.scheme or base_url}'."
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise AssistantError(f"Ollama base URL has no host: '{base_url}'.")
+    is_loopback = host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+    if is_loopback or os.environ.get(OLLAMA_ALLOW_REMOTE_ENV):
+        return
+    raise AssistantError(
+        f"Refusing to send to non-local Ollama host '{host}'. Ollama is a local "
+        f"service; set {OLLAMA_ALLOW_REMOTE_ENV}=1 to allow a remote host you trust."
+    )
+
+
+def call_model(system_prompt, user_prompt, provider="anthropic", api_key=None, model=None, base_url=None,
+               schema=None):
+    """Send one prompt to a provider and return its parsed JSON response.
+
+    `schema` is the pydantic model the caller expects back. With one, the
+    provider is held to that exact schema (structured output). Without one,
+    the provider is only asked for a JSON object - which is what the chat
+    loop and the investigation team need, because their replies take several
+    shapes ({"action": "tool" | "answer" | "findings", ...}). Forcing every
+    call into the hypothesis schema, as this once did, meant a real provider
+    could never produce a tool call: chat and the team always failed.
+
+    Extracted so every AI-backed feature - the single-shot hypothesis here
+    and the tool-calling chat in core/chat.py - shares one path for
+    provider selection, credential resolution and transient-failure
+    retry. Duplicating that per feature is how a credential fallback ends
+    up working in one place and not the other.
+
+    This function deliberately enforces NO contract on the content of the
+    response. Every caller validates what it got against its own schema
+    and its own evidence, because what counts as a citable fact differs
+    between features - and that check is the safety property, so it stays
+    with the caller that can actually perform it.
+    """
+    if provider not in SUPPORTED_PROVIDERS:
+        raise AssistantError(f"Unknown AI provider '{provider}'. Choose from: {', '.join(SUPPORTED_PROVIDERS)}")
+
+    # Fall back to a key saved via the web UI's Settings tab when neither
+    # an explicit key nor the provider's env var is present. Passing None
+    # through to the SDK stays meaningful: it lets the SDK do its own
+    # resolution (e.g. Anthropic's `ant auth login` profile), which a
+    # saved-but-empty key would otherwise pre-empt.
+    from trusttrace.core import config
+
+    config_key_name = {
+        "anthropic": "anthropic_api_key",
+        "openai": "openai_api_key",
+        "gemini": "gemini_api_key",
+    }.get(provider)
+    if config_key_name:
+        api_key = config.get_secret(config_key_name, api_key)
+    if provider == "ollama":
+        base_url = base_url or config.get_plain("ollama_base_url") or None
+        # base_url can reach this from an unauthenticated web request
+        # (web/app.py's chat/hypothesis routes). Validate it so the server
+        # can't be pointed at an arbitrary internal host as a blind-SSRF
+        # relay. Ollama is a local service, so loopback is allowed by
+        # default and a remote host needs a deliberate opt-in.
+        _validate_ollama_base_url(base_url or DEFAULT_OLLAMA_BASE_URL)
+
+    model = model or DEFAULT_MODELS[provider]
+
+    def call_provider():
+        if provider == "anthropic":
+            return _call_anthropic(system_prompt, user_prompt, api_key, model, schema)
+        if provider == "openai":
+            return _call_openai(system_prompt, user_prompt, api_key, model, schema)
+        if provider == "ollama":
+            return _call_ollama(system_prompt, user_prompt, model, base_url or DEFAULT_OLLAMA_BASE_URL, schema)
+        return _call_gemini(system_prompt, user_prompt, api_key, model, schema)
+
+    return _with_transient_retry(call_provider, provider)
+
+
+def generate_hypothesis(events, provider="anthropic", api_key=None, model=None, base_url=None):
+    """Ask an AI provider for one hedged hypothesis about `events`.
+
+    provider: one of SUPPORTED_PROVIDERS. api_key is optional for every
+    provider except Ollama (which needs none) - if omitted, each
+    provider's own SDK resolves credentials itself from its usual
+    environment variable (or, for Anthropic, an `ant auth login` profile)
+    rather than this module assuming no key means no credentials.
+    model overrides that provider's default (DEFAULT_MODELS). base_url
+    only applies to Ollama (default DEFAULT_OLLAMA_BASE_URL).
+
+    Raises AssistantError on any failure - unknown provider, missing
+    credentials, a request/network error, or a response citing evidence
+    not present in `events`. That last check runs identically regardless
+    of which provider answered - see the module docstring.
+    """
+    if not events:
+        raise AssistantError("No events provided.")
+
+    events = events[:MAX_EVENTS]
+
+    event_lines = "\n".join(_event_summary(e) for e in events)
+    prompt = (
+        "Here are the normalized events available for this hypothesis. Each line starts with "
+        "[evidence_id/event_id]. Cite only these evidence_id/event_id pairs.\n\n" + event_lines
+    )
+
+    raw = call_model(
+        SYSTEM_PROMPT, prompt, provider=provider, api_key=api_key, model=model, base_url=base_url, schema=Hypothesis
+    )
+
+    try:
+        hypothesis = Hypothesis.model_validate(raw)
+    except ValidationError as e:
+        raise AssistantError(f"AI response could not be parsed into the expected format: {e}") from e
+
+    valid_pairs = {(e.evidence_id, e.event_id) for e in events}
+    for citation in hypothesis.evidence:
+        if (citation.evidence_id, citation.event_id) not in valid_pairs:
+            raise AssistantError(
+                f"AI response cited evidence not present in the given events "
+                f"({citation.evidence_id}/{citation.event_id}) - rejected."
+            )
+
+    return hypothesis
+
+
+def _is_transient(error):
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
+def _with_transient_retry(call, provider):
+    """Retry a provider call when it fails for capacity reasons.
+
+    Provider overload and rate limiting are ordinary conditions, not
+    errors in the investigation - observed live, the Gemini flash alias
+    returned "currently experiencing high demand" while a sibling model
+    answered fine. Retrying those is the difference between a tool that
+    works and one that intermittently doesn't. Credential and
+    malformed-request failures are NOT retried: they will fail
+    identically every time, and retrying only delays a clear message.
+    """
+    import time
+
+    last_error = None
+    for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+        try:
+            return call()
+        except AssistantError as e:
+            last_error = e
+            if not _is_transient(e) or attempt == MAX_TRANSIENT_RETRIES:
+                raise
+            delay = RETRY_BACKOFF_SECONDS * (2**attempt)
+            logger.info(
+                f"{provider} reported a temporary capacity problem; retrying in {delay:.0f}s "
+                f"(attempt {attempt + 2} of {MAX_TRANSIENT_RETRIES + 1})"
+            )
+            time.sleep(delay)
+    # Unreachable in practice - the final iteration always re-raises via the
+    # `attempt == MAX_TRANSIENT_RETRIES` branch above - but fall back to a
+    # real exception so this can never `raise None`.
+    raise last_error or AssistantError(f"{provider} request failed after retries.")
+
+
+def _rejected_message(provider, how_to_set):
+    """The message for a credential that was SENT AND REFUSED.
+
+    Distinct from "no credentials found" on purpose. A 401 means a key was
+    resolved, transmitted and rejected - expired, revoked, wrong project,
+    or lacking access to the model. All three providers used to report
+    that as "no credentials found", which tells the investigator to supply
+    a key they already supplied; they set the environment variable, get
+    the identical error, and conclude the tool is broken. The failure is
+    real either way, but only one of these two messages points at it.
+    """
+    return (
+        f"{provider} rejected the credential that was sent (HTTP 401/403). A key WAS found - "
+        f"it is expired, revoked, or not authorised for this model. Replace it with {how_to_set}, "
+        f"or check the key's project and model access."
+    )
+
+
+def _json_from_text(text):
+    """The JSON object in a model's reply. JSON mode usually returns just the
+    object, but models also wrap it in a ```json fence or a sentence; take the
+    outermost {...}. Anything that is not a JSON object is a format failure."""
+    import json
+
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
+        raise AssistantError("AI response did not contain a JSON object.")
+    try:
+        value = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as e:
+        raise AssistantError(f"AI response could not be parsed as JSON: {e}") from e
+    if not isinstance(value, dict):
+        raise AssistantError("AI response was not a JSON object.")
+    return value
+
+
+def _call_anthropic(system_prompt, user_prompt, api_key, model, schema=None):
+    try:
+        import anthropic
+    except ImportError as e:
+        raise AssistantError("The 'anthropic' package isn't installed. Install with: pip install 'trusttrace[ai]'") from e
+
+    no_credentials_message = (
+        "No Anthropic credentials found. Use --api-key, set ANTHROPIC_API_KEY, or run `ant auth login`."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        if schema is None:
+            response = client.messages.create(
+                model=model,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        else:
+            response = client.messages.parse(
+                model=model,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                output_format=schema,
+            )
+    except TypeError as e:
+        # The SDK raises a plain TypeError - not an API exception, since no
+        # request was ever sent - when it can't resolve any credential
+        # source at all (no api_key, no env var, no `ant auth login`
+        # profile). Observed at client construction in some SDK versions
+        # and lazily inside messages.parse() in others, so both calls are
+        # covered by this one try block. Recognized by message text rather
+        # than a dedicated exception class - the SDK doesn't document one
+        # for this case.
+        if "authentication" in str(e).lower():
+            raise AssistantError(no_credentials_message) from e
+        raise
+    except anthropic.AuthenticationError as e:
+        raise AssistantError(
+            _rejected_message("Anthropic", "--api-key or ANTHROPIC_API_KEY")
+        ) from e
+    except anthropic.APIStatusError as e:
+        raise AssistantError(f"AI request failed: {e.message}") from e
+    except anthropic.APIConnectionError as e:
+        raise AssistantError(f"AI request failed: network error - {e}") from e
+
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        raise AssistantError("The AI's answer was cut off before it finished. Try again, or narrow the question.")
+    # Thinking blocks carry no .text, so only the answer is joined.
+    if schema is None:
+        return _json_from_text("".join(getattr(block, "text", "") for block in response.content))
+    parsed = response.parsed_output
+    if parsed is None:
+        raise AssistantError("AI response could not be parsed into the expected format.")
+    return parsed.model_dump()
+
+
+def _call_openai(system_prompt, user_prompt, api_key, model, schema=None):
+    try:
+        import openai
+    except ImportError as e:
+        raise AssistantError(
+            "The 'openai' package isn't installed. Install with: pip install 'trusttrace[ai-openai]'"
+        ) from e
+
+    no_credentials_message = "No OpenAI credentials found. Use --api-key or set OPENAI_API_KEY."
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        # .beta.chat.completions.parse rather than the newer non-beta
+        # alias, deliberately: it's been stable since openai>=1.40, giving
+        # a much wider compatible version range than pinning to whatever
+        # SDK version first promoted it out of beta.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if schema is None:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_completion_tokens=MAX_TOKENS,
+            )
+        else:
+            response = client.beta.chat.completions.parse(
+                model=model,
+                messages=messages,
+                response_format=schema,
+                max_completion_tokens=MAX_TOKENS,
+            )
+    except openai.AuthenticationError as e:
+        raise AssistantError(_rejected_message("OpenAI", "--api-key or OPENAI_API_KEY")) from e
+    except openai.OpenAIError as e:
+        # Covers both "no credentials resolvable at all" (raised at client
+        # construction, before any request) and any other SDK-level setup
+        # failure that isn't a plain network/API-status error.
+        if "credentials" in str(e).lower() or "api_key" in str(e).lower():
+            raise AssistantError(no_credentials_message) from e
+        raise AssistantError(f"AI request failed: {e}") from e
+    except openai.APIConnectionError as e:
+        raise AssistantError(f"AI request failed: network error - {e}") from e
+    except openai.APIStatusError as e:
+        raise AssistantError(f"AI request failed: {e.message}") from e
+
+    message = response.choices[0].message
+    if schema is None:
+        return _json_from_text(message.content)
+    if message.parsed is None:
+        refusal = f" ({message.refusal})" if getattr(message, "refusal", None) else ""
+        raise AssistantError(f"AI response could not be parsed into the expected format.{refusal}")
+    return message.parsed.model_dump()
+
+
+def _call_gemini(system_prompt, user_prompt, api_key, model, schema=None):
+    try:
+        from google import genai
+        from google.genai import errors as genai_errors
+        from google.genai import types as genai_types
+    except ImportError as e:
+        raise AssistantError(
+            "The 'google-genai' package isn't installed. Install with: pip install 'trusttrace[ai-gemini]'"
+        ) from e
+
+    no_credentials_message = "No Gemini credentials found. Use --api-key or set GEMINI_API_KEY."
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+                response_schema=schema,
+                # This module never passes tools, so automatic function
+                # calling has nothing to do - but the SDK enables it by
+                # default and logs a warning on every single call, which
+                # lands in the investigator's terminal mid-investigation.
+                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
+            ),
+        )
+    except ValueError as e:
+        # The SDK raises a plain ValueError at client construction - before
+        # any request - when it can't resolve an API key from either the
+        # argument or GEMINI_API_KEY/GOOGLE_API_KEY.
+        if "api key" in str(e).lower():
+            raise AssistantError(no_credentials_message) from e
+        raise
+    except genai_errors.ClientError as e:
+        if e.code in (401, 403):
+            raise AssistantError(_rejected_message("Gemini", "--api-key or GEMINI_API_KEY")) from e
+        raise AssistantError(f"AI request failed: {e.message or e}") from e
+    except genai_errors.ServerError as e:
+        raise AssistantError(f"AI request failed: {e.message or e}") from e
+
+    if schema is None:
+        return _json_from_text(response.text)
+    if response.parsed is None:
+        raise AssistantError("AI response could not be parsed into the expected format.")
+    return response.parsed.model_dump()
+
+
+def _call_ollama(system_prompt, user_prompt, model, base_url, schema=None):
+    """Ollama runs locally, needs no API key, and needs no dedicated SDK -
+    just its documented /api/chat HTTP endpoint with a JSON schema in
+    `format` for structured output (Ollama >=0.5). Uses `requests`, which
+    the base `ai` extra already depends on for exactly this provider.
+
+    Not verified against a live Ollama server in this environment (none
+    was available to test against) - implemented directly from Ollama's
+    documented /api/chat contract. Report an issue if a real server's
+    behavior differs from what's assumed here.
+    """
+    try:
+        import requests
+    except ImportError as e:
+        raise AssistantError("The 'requests' package isn't installed. Install with: pip install 'trusttrace[ai]'") from e
+
+    try:
+        response = requests.post(
+            f"{base_url.rstrip('/')}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                # A JSON schema when the caller has one; otherwise plain JSON
+                # mode, so a tool call or an answer can come back.
+                "format": schema.model_json_schema() if schema is not None else "json",
+                "stream": False,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError as e:
+        raise AssistantError(
+            f"Could not reach Ollama at {base_url} - is `ollama serve` running? ({e})"
+        ) from e
+    except requests.exceptions.HTTPError as e:
+        raise AssistantError(f"AI request failed: {e}") from e
+    except requests.exceptions.RequestException as e:
+        raise AssistantError(f"AI request failed: network error - {e}") from e
+
+    content = response.json().get("message", {}).get("content")
+    if not content:
+        raise AssistantError("AI response could not be parsed into the expected format.")
+    return _json_from_text(content)
+
+
+def record_hypothesis_request(case_dir, *, provider, model, entity_type, value, events_sent, outcome, actor=None,
+                              **extra):
+    """Append an AI-hypothesis request to the case's chain of custody.
+
+    A hypothesis sends case events to a third party and may shape what the
+    investigator looks at next, so both the request and its outcome belong
+    in the custody record - including failures. Shared by `investigate --ai`
+    and the web UI so both write the same entry.
+    """
+    from trusttrace.core import audit
+
+    return audit.record(
+        case_dir,
+        audit.AI_HYPOTHESIS_REQUESTED,
+        {
+            "provider": provider,
+            "model": model or "(provider default)",
+            "entity_type": entity_type,
+            "value": value,
+            "events_sent": events_sent,
+            "outcome": outcome,
+            **extra,
+        },
+        actor=actor,
+    )
+

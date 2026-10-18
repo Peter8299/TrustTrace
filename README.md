@@ -1,0 +1,378 @@
+<div align="center">
+
+# TrustTrace
+
+**Turn packet captures and endpoint logs into one correlated, evidence-cited investigation — entirely on your own machine.**
+
+[![PyPI](https://img.shields.io/pypi/v/trusttrace.svg)](https://pypi.org/project/trusttrace/)
+[![Tests](https://github.com/Sh3n0bi/TrustTrace/actions/workflows/tests.yml/badge.svg)](https://github.com/Sh3n0bi/TrustTrace/actions/workflows/tests.yml)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Wireshark: optional](https://img.shields.io/badge/wireshark-optional-informational.svg)](docs/wireshark.md)
+
+[Use cases](#use-cases) · [Install](#installation) · [How it works](docs/architecture.md) · [Worked example](docs/walkthrough.md) · [Commands](docs/commands.md) · [Deploy & sizing](docs/deployment.md) · [Limitations](#limitations)
+
+</div>
+
+---
+
+## Contents
+
+- [Overview](#overview) · [Use cases](#use-cases) · [Why it exists](#why-it-exists)
+- [Installation](#installation) · [Quick start](#quick-start)
+- [Limitations](#limitations) · [Testing](#testing) · [Contributing](#contributing)
+
+**Reference:** [Capabilities](docs/capabilities.md) · [Commands](docs/commands.md) · [HTTP API](docs/api.md) · [Wireshark](docs/wireshark.md) · [Architecture & performance](docs/architecture.md) · [Deployment, sizing & compliance](docs/deployment.md) · [Worked example](docs/walkthrough.md) · [Validation](docs/validation.md)
+
+---
+
+## Overview
+
+TrustTrace takes raw digital evidence — packet captures, JSON/CSV logs, Windows Event Logs including Sysmon — and turns it into a single correlated investigation: normalized events, extracted entities, a unified timeline, an entity relationship graph, deterministic detections, and investigator-owned findings you can export as a report.
+
+It runs entirely on your machine. **No cloud backend, no daemon, no database server, and no step that touches the network unless you explicitly opt into one.** A case is one DuckDB file plus a directory of JSON manifests and read-only evidence copies.
+
+| | |
+|---|---|
+| **Input** | `.pcap` / `.pcapng` · `.json` · Suricata `eve.json` · `.csv` · `.evtx` · live network capture |
+| **Output** | Timeline · entity graph · detections · ATT&CK mapping · findings · Markdown / JSON / HTML reports |
+| **Interfaces** | CLI (`trusttrace`) and a local web UI — both over the same core |
+| **Requires** | Python 3.9+. Wireshark optional but recommended. |
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/story.png" alt="The What happened view of the demo case: a critical assessment, the intrusion stages it passed through, and each finding with the events it cites" width="900">
+</p>
+
+**See it on your own machine in one command** — no evidence of your own needed:
+
+```bash
+pip install "trusttrace[pcap,web]"
+trusttrace demo --open
+```
+
+<details>
+<summary><b>More screenshots</b> — overview, detections, timeline</summary>
+
+<br>
+
+**Overview** — the story up front, then the counts.
+<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/overview.png" alt="Case overview dashboard with the story summary and KPI tiles" width="900">
+
+**Detections** — offline, deterministic rules, each pointing at the event it matched.
+<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/detections.png" alt="Detections table with severities, rules, events and descriptions" width="900">
+
+**Timeline** — every source normalized into one chronological view.
+<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/timeline.png" alt="Timeline of normalized DNS, HTTP, flow and anomaly events" width="900">
+
+<sub>All screenshots are of `trusttrace demo`: fabricated traffic, no real hosts or data.</sub>
+
+</details>
+
+---
+
+
+## Use cases
+
+**Triage a suspicious capture from an alert.** Point it at the pcap, run one command, and read the timeline. Protocol-level events — DNS lookups, HTTP requests and their status codes, TLS SNI, recovered file transfers — come out already normalized, so you start at "what happened" rather than at packet 1.
+
+```bash
+trusttrace evidence add ./alert-2026-08-28.pcap --case INC-0001 && trusttrace analyze --case INC-0001
+```
+
+**Tie network activity to what happened on the host.** Add a pcap *and* a Sysmon EVTX export to the same case. Because entity IDs are derived deterministically from normalized values, the same IP or hostname in both sources resolves to the same ID and joins automatically — which is the whole reason the two are worth having in one case.
+
+**Investigate one indicator across everything you hold.** Given an IP, domain, hash, user, host, process, or file, get its first/last seen, a scoped timeline, ranked related entities, a one-hop relationship graph, and deterministic next-step leads.
+
+```bash
+trusttrace investigate --case INC-0001 --domain suspicious.example.com
+```
+
+**Check a threat-intel feed against the evidence.** Import a vendor feed — plain text, CSV, STIX 2.1 or MISP — and every indicator the case touches becomes a finding at the top of the story. Defanged values from a PDF are accepted, and the feed's hash goes into the chain of custody.
+
+```bash
+trusttrace ioc import ./campaign-feed.txt --case INC-0001
+```
+
+**Run lightweight live monitoring on a segment.** Rotating capture auto-ingests each finished window through the same pipeline, detection rules included — so a match surfaces as an alert without any separate "watch" mode.
+
+**Analyse a web attack from server-side capture.** Aggregate rules are built for this: they summarize a 41,000-request scan into a handful of findings rather than 41,000 rows, and separately surface *the paths that actually returned success* — what the scan found, not just that it happened.
+
+**Produce a defensible report.** Every claim cites the `evidence_id` and `event_id` it rests on. Evidence is hashed on ingest and never modified; every action is recorded in a hash-chained custody log you can verify. Export the whole case to a zip with a per-file manifest and hand it to someone else.
+
+> **Not a NIDS, not a SIEM.** There is no rule marketplace, no alert queue, no multi-user server, no retention tier. It is an investigator's workbench for evidence you already have.
+
+---
+
+
+## Why it exists
+
+Real investigations span evidence formats that share no schema, no identifiers, and no notion of which events relate to which. Answering *"is the IP in this pcap the same host as the one in that log line?"* by hand is slow and error-prone, and the reasoning usually lives in someone's head rather than in the case.
+
+TrustTrace does that stitching mechanically and keeps every resulting claim traceable to the specific evidence file and event it came from.
+
+### Design principles
+
+| Principle | What it means in practice |
+|---|---|
+| **Deterministic first** | Parsing, correlation, timeline, and detections involve no AI and no network. Identical input produces identical output. |
+| **Everything cites evidence** | No claim appears without the `evidence_id` / `event_id` it rests on. |
+| **Never overstate certainty** | Correlation says `related` or `possible_relationship`, never "caused". Detections are flags, not verdicts. |
+| **The investigator decides** | Nothing auto-creates a finding. AI proposes; a human confirms. |
+| **Local-first, no infrastructure** | One DuckDB file plus a directory per case. No queue, no graph DB, no daemon. |
+| **Honest about limits** | Known weaknesses are documented [here](#limitations) and in code, not hidden. |
+
+---
+
+
+## Installation
+
+**From [PyPI](https://pypi.org/project/trusttrace/)** — the quickest way to get the `trusttrace` command:
+
+```bash
+pip install "trusttrace[pcap,intel,web]"
+```
+
+**From source** — for development, or to run the latest unreleased code:
+
+```bash
+git clone https://github.com/Sh3n0bi/TrustTrace.git
+cd TrustTrace
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[pcap,intel,web]"
+```
+
+**With Docker** — no Python, scapy or Wireshark to install; the image bundles **tshark**, so pcap parsing uses the fast engine automatically.
+
+```bash
+docker build -t trusttrace .
+docker run --rm -p 8000:8000 -v trusttrace-data:/data trusttrace
+```
+
+The container prints a one-time access token and a `http://localhost:8000/?token=…` URL (the web UI requires a token when it isn't on loopback). Set your own with `-e TRUSTTRACE_WEB_TOKEN=…` to keep it stable. Cases and saved settings persist in the `/data` volume. Any CLI command works too, e.g. `docker run --rm -v trusttrace-data:/data trusttrace case list`.
+
+Once images are published, you can skip the build with `docker pull ghcr.io/sh3n0bi/trusttrace`.
+
+### Python extras
+
+Everything beyond case management and the CLI core is optional.
+
+| Extra | Pulls in | Needed for |
+|---|---|---|
+| `pcap` | scapy, pandas, scikit-learn | pcap/pcapng parsing, live capture, anomaly scoring |
+| `evtx` | python-evtx | Windows Event Log / Sysmon parsing |
+| `intel` | requests | VirusTotal lookups |
+| `ai` | anthropic, requests | AI assistant — Anthropic and Ollama providers |
+| `ai-openai` | openai | AI assistant — OpenAI provider |
+| `ai-gemini` | google-genai | AI assistant — Google Gemini provider |
+| `web` | flask | Local web UI |
+| `dashboard` | dash, plotly | Legacy `trusttrace scan` visualization |
+| `dev` | pytest | Test suite |
+| `build` | build, twine | Packaging a release (maintainers) |
+
+Only `intel`, `ai`, `ai-openai`, and `ai-gemini` can reach the network, and only when you explicitly invoke the feature that uses them. Ollama's traffic stays on your machine.
+
+### Wireshark (optional, external)
+
+Wireshark is **not** a pip extra — it is a separate program, and TrustTrace uses three binaries from it. All are optional; install none and the pure-Python path handles everything.
+
+| Binary | Used for | Without it |
+|---|---|---|
+| **`tshark`** | Dissection, display filters, slices, object export | Falls back to the built-in scapy engine |
+| **`dumpcap`** | Live capture | Falls back to the scapy sniffer |
+| **`Wireshark`** *(GUI)* | The `wireshark open` pivot only | `--print` still gives you the command to run elsewhere |
+
+**`tshark` is the one that matters.** It carries the whole analysis path, so a server, container, or CI runner only needs that — no GUI, no Qt, no desktop stack:
+
+```bash
+sudo apt install tshark          # Debian / Ubuntu
+sudo dnf install wireshark-cli   # Fedora / RHEL
+brew install wireshark           # macOS (CLI tools; add --cask for the GUI)
+```
+
+On a Windows analyst workstation the [standard Wireshark installer](https://www.wireshark.org/download.html) provides all three. It does not add itself to `PATH`, which is fine — TrustTrace checks `C:\Program Files\Wireshark` directly.
+
+```bash
+trusttrace wireshark status
+```
+
+```
+Wireshark: 4.6.8
+  tshark:  C:\Program Files\Wireshark\tshark.exe
+  dumpcap: C:\Program Files\Wireshark\dumpcap.exe
+  GUI:     C:\Program Files\Wireshark\wireshark.exe
+Parse engine:   tshark (requested: auto)
+Capture engine: dumpcap
+```
+
+See [Wireshark integration](docs/wireshark.md) for what each one changes.
+
+### Verify the environment
+
+```bash
+trusttrace doctor
+```
+
+`doctor` is read-only: it reports the Python version, the DuckDB case store, each
+optional evidence engine (scapy, scikit-learn, python-evtx, tshark/dumpcap), the
+active pcap engine, and whether an AI provider or VirusTotal key is configured.
+A missing *optional* capability is shown as a note with its fallback, not a
+failure — the command exits non-zero only when a core dependency is broken. Add
+`--json` for a machine-readable report. `trusttrace --version` prints the
+installed version.
+
+---
+
+
+## Quick start
+
+### Command line
+
+```bash
+trusttrace case create --name "Test Incident"
+trusttrace evidence add ./capture.pcap --case INC-0001
+trusttrace analyze --case INC-0001
+trusttrace detections list --case INC-0001
+trusttrace investigate --case INC-0001 --ip 192.168.1.10
+trusttrace report generate --case INC-0001 --format html
+```
+
+### Try it without evidence of your own
+
+```bash
+trusttrace demo            # build a synthetic incident, analyze it, print the story
+trusttrace demo --open     # ...then open it in the web UI
+```
+
+`trusttrace demo` builds a synthetic capture containing a complete incident — a lookup of a cheap-TLD domain, an executable pulled over cleartext HTTP, a credential posted in the clear, a private key retrieved, the same password reused on FTP, a customer CSV uploaded in chunks, then eight beacons — plus ordinary browsing, so the capture is not made entirely of findings. It creates a new case (named *Demo incident (synthetic)*) each time it runs, so it never touches an existing one. It needs the `pcap` extra.
+
+The same steps by hand, if you want the capture file itself:
+
+```bash
+python samples/generate_incident.py -o incident.pcap
+trusttrace case create --name "Demo incident"
+trusttrace evidence add ./incident.pcap --case INC-0001
+trusttrace analyze --case INC-0001
+trusttrace story --case INC-0001
+```
+
+```
+7 distinct findings (5 high severity) across 2 hosts.
+
+Assessment [critical]: Evidence is consistent with data leaving this network
+after a credential was exposed.
+
+CREDENTIAL ACCESS
+  [high] 22:14:19  One credential used across several protocols
+      The same password was observed on FTP, HTTP. Reuse turns a single
+      cleartext disclosure into access everywhere that credential is accepted.
+      evidence: EVT-EV-0001-000009
+```
+
+A generator rather than a checked-in `.pcap`, deliberately: a binary in a repository is something you take on trust, and this is the same capture expressed as something you can read and diff. The traffic is fabricated end to end — no real host is contacted and nothing is captured from a real network. Every act is detected identically by both dissection engines, so this works with or without Wireshark installed.
+
+
+### Browser
+
+```bash
+trusttrace web --cases-dir cases      # then open http://127.0.0.1:8000
+```
+
+1. **Choose how the AI assistant runs** *(optional - on the first screen, or Settings)* — on this computer with **local AI** (Ollama: private and free; the page detects it and lists your models) or with an **API key** (Anthropic, OpenAI or Gemini, saved and tested in one step). Everything except threat intel and the AI assistant works with no AI and no keys at all.
+2. **New investigation** — name the case, drop in your evidence (pcap, pcapng, evtx, JSON, CSV) and press **Create and analyze**. It uploads, hashes, analyzes and opens on the story in one step.
+3. **What happened** — read the account of the case before the counts: the assessment, the stages
+   it passed through, and each finding with the events it rests on.
+4. Review **Timeline**, **Entities**, **Detections**, **ATT&CK**, **Custody**; record **Findings**; export a **Report**.
+
+---
+
+
+## What it does
+
+Each of these is covered properly in [the capability reference](docs/capabilities.md); this is the map.
+
+| | |
+|---|---|
+| **Evidence integrity** | Copied in, SHA-256 hashed from the stored copy, set read-only, recorded in a manifest. |
+| **Chain of custody** | Every action appended to a hash-chained log. `case audit --verify` reports whether it has been altered. |
+| **Parsers** | `.pcap`/`.pcapng` (tshark or scapy), `.json`, Suricata `eve.json`, `.csv`, `.evtx` — all normalized into one Common Event Model. |
+| **Search** | Content search over a capture's raw bytes: text, regex, or hex. ~6s across 1,000,000 packets. |
+| **Conversations** | Conversations reassembled by Wireshark, each described in plain words (who sent what to whom, and whether it could be read), with a protocol glossary and an optional AI explanation. |
+| **Triage** | The first questions worth asking an unfamiliar capture: protocols, flags, credentials, secrets, recoverable files. |
+| **Entities & correlation** | Deterministic IDs join the same real-world thing across evidence sources. Links are `related` or `possible_relationship`, never "caused". |
+| **Detections** | Offline rules — no AI, no network — for web scans, network intrusions and Windows hosts (brute force, Kerberoasting, LSASS dumps, LOLBins, log clearing, ransomware prep…), run automatically on every `analyze`. |
+| **ATT&CK** | Deterministic, evidence-cited technique suggestions with an investigator-settable status. |
+| **Assistant** | Retrieves evidence through read-only tools; every claim is checked against what it retrieved, and an answer citing anything else is refused. |
+| **Investigation team** | `trusttrace team` or the web UI's *Investigation team* panel — network and host AI analysts each investigate their own part of the evidence; their cited findings are merged and ranked, and can be saved as Open findings for review. |
+| **Findings & reports** | Investigator-owned findings citing evidence/event pairs; Markdown, JSON and HTML output. |
+| **Web UI** | A dashboard over the same core the CLI uses. No build step, no CDN, works offline. |
+| **Live capture** | Rotating windows auto-ingested through the same pipeline, detection rules included. |
+| **Portability** | Export a case to one zip with a per-file SHA-256 manifest; import verifies every file first. |
+
+---
+
+## Limitations
+
+Stated plainly, because a forensics tool that hides its weaknesses is worse than one that has them.
+
+> **Maturity and evidentiary use.** TrustTrace is Beta software (`0.2.x`). It is built to *support* sound evidence-handling practice — read-only evidence copies, a tamper-evident custody chain, deterministic detections — but it is **not accredited or validated against any forensic standard**, and nothing here is a claim that its output is admissible or court-ready. Treat it as an investigator's analysis aid; have a qualified examiner validate any finding you intend to rely on formally.
+
+- **The correlation link count is a ceiling, not a total.** It caps at 50,000 pairs, and on a dense capture it will reach that: tens of thousands of shared-host pairs inside a five-minute window genuinely exist. The budget is now spent on signal first — ports are not correlated on, no entity may take more than a tenth of it, and `related` is never displaced by `possible_relationship` — and both the CLI and the API say when the number is a ceiling. Shorten `--time-window` on a dense case; detections and the timeline are the better entry points either way.
+- **Anomaly detection is disabled above ~20,000 packets.** IsolationForest's `contamination` is a *proportion*, so on a large capture it flags a fixed percentage of everything by construction — a quantile, not a finding. It stays on for smaller captures where an outlier means something.
+- **HTTP request/response pairing is FIFO per flow.** Correct for ordinary keep-alive traffic; genuinely pipelined requests could mis-pair, so a response's URL is a reference rather than a certainty.
+- **Correlation memory is reduced but not constant** — it still holds one entity-link map proportional to the case.
+- **ATT&CK coverage is deliberately small** (four techniques). Each was chosen because the signal is specific, not to pad a matrix.
+- **EVTX maps five Sysmon event types and ~25 Security/System/PowerShell event IDs** (logons, process creation, account/group changes, Kerberos/NTLM, service installs, log clearing, script blocks); everything else is kept generically. Large EVTX files parse slowly (python-evtx is pure Python, a few hundred records/s).
+- **The custody hash chain** detects corruption and casual editing, not an attacker who owns the machine.
+- **Live capture needs Npcap/libpcap and elevated privileges**, which this tool does not install or grant.
+- **Ingest is the scaling limit, not dissection.** tshark reads a 1M-packet capture in 46 seconds; putting those events and their entity links into the store takes about fourteen minutes, and throughput degrades with case size (4,497 events/s at 100k against 1,907/s at 1M) because every entity-link insert probes a growing index. For very large captures the workflow is to **search and slice first, then ingest the slice** — search and `wireshark slice` read the capture file and scale to gigabytes.
+- **The assistant has not been exercised against a live provider in this repository's testing.** Its tool loop and refusal path are covered against a scripted model, and the request each provider receives is tested with only the network call faked - which is how a bug that stopped chat and the investigation team working on *every* real provider was found and fixed. A round trip to a real Anthropic, OpenAI, Gemini or Ollama server is not part of the suite.
+- **The two pcap engines do not produce identical output.** That is the point — tshark sees protocols the scapy engine cannot — but it means a case re-analyzed under a different engine will not have identical events. Each event records the engine that produced it, and `--engine` pins one when reproducibility matters.
+- **tshark object export runs as a second pass** over the capture. It keeps the streaming parse's memory profile intact, at the cost of reading the file twice when an output directory is given.
+- **Exported objects carry no timestamp.** tshark's object export reports the recovered file but not the frame it completed on, so `file_transfer` events from it sort at the end of the timeline as `unknown` rather than in position. A wrong timestamp on forensic evidence is worse than an absent one, so none is invented — the parent flow's events carry the timing.
+- **The web UI has no per-user accounts.** On `127.0.0.1` (the default) it is unauthenticated by design. Binding it off loopback now *requires* a shared token (`--auth-token` / `TRUSTTRACE_WEB_TOKEN`) and the CLI refuses to start without one — but that single token is all the access control there is; still front it with TLS. See [docs/deployment.md](docs/deployment.md).
+
+---
+
+
+## Testing
+
+```bash
+pip install -e ".[dev,pcap,intel,evtx,ai,ai-openai,ai-gemini,web]"
+pytest
+```
+
+**770+ tests**, run in CI against Python 3.9 and 3.12 on Linux and against 3.12 on Windows and macOS (the analyst-workstation platforms), plus a dedicated job that installs tshark so the Wireshark integration is genuinely exercised rather than skipped, a `ruff` lint gate ([tool.ruff] in `pyproject.toml`), and a packaging check that installs the built wheel into a clean environment and confirms the web UI's assets are actually bundled.
+
+Lint locally with the same rules CI enforces:
+
+```bash
+ruff check .
+```
+
+The suite favours real fixtures over mocks: pcaps built with scapy, EVTX from hand-crafted XML matching the real schema, cases from `tmp_path`, and real tshark invocations wherever Wireshark is present. Mocks are reserved for what genuinely cannot be exercised in CI — external APIs, and opening a live network interface.
+
+Several classes of bug were found only by running against real evidence and real tooling rather than synthetic fixtures — silently-dropped IPv6, HTTPS payloads skipped because scapy re-dissects them, DNS missed off port 53, a quadratic insert that made a 30 MB file take over 15 minutes, and a live-capture counter that reported the session total in the per-window field. Each is now pinned by a regression test.
+
+---
+
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the parser plugin interface, and [RELEASING.md](RELEASING.md) for how to cut a release to PyPI. Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+The shape of a good contribution here: a new `BaseParser` subclass for a format, a detection rule with a specific and defensible signal, or a regression test for a bug found against real evidence.
+
+
+## Security policy
+
+This is defensive tooling for evidence you are authorized to analyze. It does not exploit, attack, or scan anything.
+
+Nothing leaves your machine unless you explicitly invoke threat intel or a hosted AI provider. Live capture requires privileges the tool does not grant itself. To report a vulnerability, please follow [SECURITY.md](SECURITY.md) (private disclosure via GitHub Security Advisories) rather than opening a public issue.
+
+
+## License
+
+[MIT](LICENSE).
+
+

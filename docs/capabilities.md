@@ -1,0 +1,356 @@
+[← README](../README.md) · [Capabilities](capabilities.md) · [Commands](commands.md) · [HTTP API](api.md) · [Wireshark](wireshark.md) · [Architecture](architecture.md) · [Walkthrough](walkthrough.md)
+
+---
+
+# Capabilities
+
+## Case management
+`INC-####` IDs, one directory per case, a status lifecycle (`open` / `investigating` / `closed`, settable from the CLI or the dashboard), indexes over evidence, findings and artifacts, and irreversible deletion behind a typed confirmation.
+
+## Evidence integrity
+Every item is copied in, SHA-256 hashed from the stored copy, set read-only, and recorded in a manifest with its original path and modification time.
+
+## Chain of custody
+Every action — case created, evidence added, evidence parsed, analysis run, finding created or updated, report generated, capture started or stopped, threat intel checked, AI hypothesis requested, evidence sliced — is appended to a **hash-chained** `audit.log`. `case audit --verify` reports whether the record has been altered since it was written.
+
+> This detects accidental corruption and casual after-the-fact editing. It does **not** stop an attacker who controls the machine, who could recompute the whole chain.
+
+## Evidence parsers
+All parsers normalize into one **Common Event Model**: `event_id`, `evidence_id`, `source`, `event_type`, `timestamp`, plus optional user/host/device, network (src/dst IP + port, protocol), process (name, PID, parent, command line), file (name, path, hash), domain/URL, severity/message, and `raw_event_reference` pointing back to the exact original record.
+
+| Format | Notes |
+|---|---|
+| `.pcap` / `.pcapng` | Two interchangeable engines — **tshark** when Wireshark is installed, **scapy** (pure Python, no external binary) otherwise. Single streaming pass either way. |
+| `.json` | Array, `{"events": [...]}`-wrapped, or single object. Case/separator-insensitive field aliasing (`src_ip` / `SourceIP` / `source_ip` all match). |
+| Suricata `eve.json` | Detected by content (JSON Lines with a Suricata `event_type`) and mapped from its own schema: `alert` (with severity), `dns`, `http`, `tls`, `flow`, `fileinfo`, `anomaly`. Point it at the NSM log you already have. |
+| `.csv` | Same aliasing, one event per row. |
+| `.evtx` | Sysmon (ProcessCreate, NetworkConnection, ProcessTerminate, FileCreate, DNSQuery) gets rich field mapping. **Security log**: logon success/failure with logon type, source IP and failure reason (4624/4625), logoff (4634/4647), explicit credentials (4648), privileged logon (4672), process creation/exit (4688/4689), service and scheduled-task creation (4697/4698/4702), account create/enable/reset/delete (4720/4722/4724/4726), group membership (4728/4732/4756), lockout (4740), Kerberos TGT/service ticket/pre-auth failure with encryption type (4768/4769/4771), NTLM validation (4776), audit log cleared (1102). **System**: service installed (7045), log cleared (104). **PowerShell**: script blocks (4104). Every other record gets universal System fields plus full raw EventData. Records the reader cannot decode are skipped and counted, never fatal. Pure Python, so Windows logs can be analyzed from any OS. |
+
+Adding a fifth format means one `BaseParser` subclass — entity extraction, correlation, timeline, detections, and reporting need no changes.
+
+## Network protocol analysis
+
+The pcap parser has two engines. Neither is a superset of the other, so neither is hardcoded — `auto` picks tshark when Wireshark is installed and scapy when it is not, and `--engine` pins either one.
+
+**scapy engine** — pure Python, works from a plain `pip install`, and produces **eight event types**, over both **IPv4 and IPv6**:
+
+| Event type | What it captures |
+|---|---|
+| `network_connection` | One per distinct flow — TCP, UDP **and ICMP** — with packet and byte counts. Includes flows with no payload at all (handshakes, ACKs), which are most of real traffic. |
+| `dns_query` | Queried name → `domain`. Detected **by payload, not port**, so DNS tunnelling off port 53 is caught. |
+| `dns_response` | What the name actually resolved to — the mapping that links a domain in one evidence item to an IP in another. |
+| `http_request` | Host → `domain`, full URL → `url`, User-Agent retained. Matched on the request line, so it works on **any** port. |
+| `http_response` | Status code, paired back to the URL it answered — what separates a failed scan from a successful one. |
+| `tls_handshake` | SNI hostname → `domain`, usually the only identifying detail recoverable from encrypted traffic. |
+| `file_transfer` | Files carved from TCP streams by magic bytes (PDF, PNG, JPG, ZIP, EXE, GIF), optionally written to `artifacts/`. |
+| `anomaly` | IsolationForest outliers over size / inter-arrival / ports. Small captures only — see [Limitations](../README.md#limitations). |
+
+Also handled: VLAN (802.1Q) tags, IP fragments, pcapng containers, truncated captures *(keeps what was read)*, and malformed payloads *(never aborts the parse)*.
+
+**tshark engine** — Wireshark's ~3000 dissectors instead of eight hand-written analyses. Same Common Event Model, same streaming, and it adds what the scapy engine structurally cannot see:
+
+| Event type | What the tshark engine adds |
+|---|---|
+| `authentication` | **Kerberos and NTLM attempts** — principal, realm, workstation. Lateral movement *is* authentication traffic; to the scapy engine a Kerberoasting run is an unremarkable TCP flow to port 88. |
+| `file_access` | SMB file opens, reads and writes, naming the share path touched. |
+| `file_transfer` | **Real object export** (HTTP, SMB, FTP-DATA, TFTP, IMF) — the dissector knows where each object begins and ends, rather than inferring it from magic bytes. When Wireshark cannot tie an FTP data connection to a file (no `PASV`/`PORT` in the capture), TrustTrace pairs the `STOR`/`RETR` command with its data connection itself and recovers the file byte-exact, named from the command. |
+| `network_connection` | Wireshark's own protocol stack per flow (`eth:ethertype:ip:tcp:tls:http2`), so an unfamiliar flow is identifiable without reopening the capture. |
+
+Everything else — DNS, HTTP request/response pairing, TLS SNI, flow aggregation, anomaly scoring — is produced by both engines, **under the same event-type names**, so a timeline filter or a detection rule behaves identically whichever engine ran. Every event also records which engine produced it in `raw_event_reference.engine`, because *"which dissector found this"* is a question a report has to answer months later.
+
+## Content search
+Parsing normalizes packets into events and **deliberately keeps no payload** — storing the bytes of every packet would defeat the streaming design. So *"where does this token appear"* has to go back to the capture file, which is what `trusttrace search` does, via tshark. Text, regex, or hex:
+
+```bash
+trusttrace search --case INC-0001 'flag{'
+trusttrace search --case INC-0001 'flag\{[^}]+\}' --mode regex
+trusttrace search --case INC-0001 '4d5a9000' --mode hex          # MZ header
+trusttrace search --case INC-0001 'password' --display-filter 'http'
+```
+
+**Measured on a 1,000,000-packet / 132 MB capture: about six seconds.** Every hit reports a frame number *and* a stream index, so a result leads straight to the packets — `wireshark open` takes the frame, `stream follow` takes the stream.
+
+Case-insensitive search compiles to `matches` over an escaped literal rather than to `contains`, because `contains` is a case-sensitive byte match. The alternative — lowercasing the evidence — is not something a forensics tool should do to the bytes it reports on.
+
+## Stream reassembly
+A credential or a flag rarely lives in one packet; it lives in a conversation the network split across dozens of them.
+
+```bash
+trusttrace stream list   --case INC-0001          # ranked by volume
+trusttrace stream follow --case INC-0001 42
+```
+
+Reassembly is delegated to Wireshark rather than reimplemented: retransmissions, overlap and reordering are genuinely hard, and a hand-rolled version would be a subtly wrong copy of something you can check against the GUI.
+
+## Triage presets
+The first questions worth asking an unfamiliar capture, in one command — protocol hierarchy (flagging every protocol that carries credentials in the clear), candidate flags, credentials and secrets, recoverable files with hashes, and the largest conversations.
+
+```bash
+trusttrace ctf triage --case INC-0001
+trusttrace ctf hunt   --case INC-0001 --category secrets
+trusttrace ctf patterns
+```
+
+Named for the case it serves best — a CTF network challenge — but the questions are the ones that open a real intrusion investigation too.
+
+Two rules it keeps. It **never writes to the case**: nothing here creates a finding, and object export is reported rather than saved unless you pass `--extract-to`. And it reports **candidates, not verdicts** — a regex matching something password-shaped has found a string, so every result names the pattern that matched and the frame it came from, and the judging happens against the packets.
+
+## Entity extraction & correlation
+Eleven entity types — `user`, `hostname`, `device`, `ip_address`, `domain`, `url`, `file`, `hash`, `process`, `port`, `network_connection` — each linked to the events it appears in.
+
+Two modelling rules matter more than the list:
+
+- **A source port is not an entity.** It is ephemeral — the OS picks it per socket — so it identifies a connection, never a thing an investigation is about. `dst_port` *is* indexed, because that identifies a service and *"show me everything touching port 4444"* is a real question. Both remain fields on the event, so timeline filters and search are unaffected.
+- **`network_connection` is keyed on the host pair**, not the full flow tuple. With ports in the key it was unique per flow, so it could never be *shared* between two events — an entity that by construction correlated with nothing, at one row per event.
+
+Correlation links events within a time window and is explicit about strength:
+
+- **`related`** — shares an entity *and* is time-proximate
+- **`possible_relationship`** — time-proximate only
+
+Neither implies causality, and the reports say so.
+
+Three rules keep the link budget spent on signal:
+
+- **A shared port is not a relationship.** On an HTTP capture *"both events touched port 80"* is true of nearly every pair. Measured before this rule on a 3,000-packet capture: 38,782 of 50,000 links were shared-port links, 29,333 of them port 80 alone, against **33** keyed on a shared domain. Ports are indexed; they are not correlated on.
+- **No single entity may take more than a tenth of the budget.** Correlation is pairwise, so a high-degree entity produces links *quadratically* — with ports removed, one address took 49,536 of 50,000 links and left 100 for every domain combined.
+- **`related` is never displaced by `possible_relationship`.** The weak tier only ever uses budget the strong tier left.
+
+**The link count is a ceiling, not a total.** A number landing exactly on the budget means correlation stopped, and both the CLI and the API say so rather than printing the round number as though it were a finding. On a dense capture, shorten `--time-window`.
+
+## Timeline
+One chronological view across all evidence, filterable by time range, user, IP, hostname, process, file, event type, or evidence source.
+
+## Detection rules
+Local, deterministic, zero-cost pattern matches. **No AI, no network call.** They run automatically on every `analyze` — unlike ATT&CK mapping, which is opt-in.
+
+**Per-event rules**
+
+| Rule | Fires on |
+|---|---|
+| `OFFENSIVE-TOOL-NAME` | Process names of credential-access / lateral-movement tooling (matched on the basename, so full Sysmon/4688 paths match) |
+| `SUSPICIOUS-PORT` | Ports historically associated with C2 frameworks |
+| `DOUBLE-EXTENSION-FILE` | Executables disguised as documents (`invoice.pdf.exe`) |
+| `CREDENTIAL-ARTIFACT` | SAM hive, `ntds.dit`, lsass dumps |
+
+**Aggregate rules** — these summarize across many events, because emitting one detection per packet would bury a 41,000-request scan under 41,000 identical rows.
+
+| Rule | Fires on |
+|---|---|
+| `ATTACK-TOOL-USER-AGENT` | Scanner / exploitation tooling by User-Agent (gobuster, sqlmap, nikto, ffuf, nmap, hydra…) |
+| `HTTP-PATH-ENUMERATION` | One source requesting many distinct paths from one host |
+| `SQL-INJECTION-ATTEMPT` | Injection payloads, **URL-decoded** first. Rated *high* only when the server actually returned success — intent and impact are different findings. |
+| `SCAN-SUCCESSFUL-PATHS` | The paths that returned success amid a 404-heavy scan — *what the scan actually found* |
+
+**Network rules** — the eight rules above grew from endpoint and web-scan evidence and matched nothing on a network intrusion. These cover that surface.
+
+| Rule | Fires on |
+|---|---|
+| `SUSPICIOUS-TLD` | Domains on TLDs cheap enough to be used in bulk by phishing and malware infrastructure. *Low* on purpose: common in legitimate use too |
+| `EXECUTABLE-DOWNLOAD` | An executable retrieved over **cleartext** HTTP. Not the file type alone — flagging every `.exe` would train people to ignore the rule |
+| `CLEARTEXT-CREDENTIALS` | A credential crossing the network unencrypted (HTTP form, HTTP Basic, FTP, IMAP, POP, Telnet) |
+| `KEY-MATERIAL-IN-TRANSIT` | Private key material by filename or content (`id_rsa`, `BEGIN … PRIVATE KEY`) |
+| `OUTBOUND-BULK-TRANSFER` | Volume to an **external** host. Internal-to-internal is a file copy, and flagging it would bury the case that isn't |
+| `PERIODIC-BEACON` | Repeated low-volume contact at a machine-regular interval |
+| `CREDENTIAL-REUSE` | The **same** password observed on more than one protocol — a join no single-event rule can make |
+
+**Host rules** (`core/host_detections.py`) — over Windows Security/System/PowerShell EVTX and Sysmon. Each description names its ATT&CK technique.
+
+| Rule | Fires on |
+|---|---|
+| `LOG-CLEARED` | Security log cleared (1102) or any event log cleared (104) |
+| `OFFICE-SPAWNED-SHELL` | Word/Excel/Outlook/… starting a shell, script host or LOLBin — the classic malicious-macro tell |
+| `ENCODED-POWERSHELL` | `powershell -EncodedCommand <base64>` |
+| `SUSPICIOUS-POWERSHELL` | Script-block (4104) content: AMSI bypass, download cradle, download-and-execute, Mimikatz, known offensive modules, in-memory shellcode loading |
+| `LOLBIN-DOWNLOAD` / `LOLBIN-DECODE` / `LOLBIN-EXECUTION` | The *abusive* use of built-in tools, not the tool: `certutil -urlcache`/`-decode`, `bitsadmin /transfer`, `mshta http…`, `regsvr32 /i:http` (Squiblydoo), `rundll32 javascript:`, `wmic process call create` |
+| `LSASS-DUMP` | `rundll32 comsvcs.dll MiniDump`, `procdump … lsass` |
+| `CREDENTIAL-HIVE-EXPORT` | `reg save HKLM\SAM/SECURITY/SYSTEM`, `ntdsutil ifm` |
+| `INHIBIT-RECOVERY` | Shadow copies / backups deleted, recovery disabled (`vssadmin`, `wmic shadowcopy`, `wbadmin`, `bcdedit`) — ransomware preparation |
+| `SUSPICIOUS-SERVICE` | Service installed (7045/4697) whose command is an interpreter, `PSEXESVC`, or a binary in a user-writable path |
+| `SUSPICIOUS-SCHEDULED-TASK` | Scheduled task (4698/4702) whose action is the same kind of command |
+| `PRIVILEGED-GROUP-CHANGE` | Member added to Administrators, Domain/Enterprise/Schema Admins, operators groups (*high*) or Remote Desktop Users (*medium*) |
+| `EXTERNAL-RDP-LOGON` | RDP logon (type 10) from an internet-routable address |
+| `NEW-CREDENTIALS-LOGON` | Logon type 9 via `seclogo` — `runas /netonly`, and also pass-the-hash tooling |
+| `BRUTE-FORCE` / `BRUTE-FORCE-SUCCESS` | ≥10 failed logons (4625, 4771) for one account; *high* when a successful logon for it follows |
+| `PASSWORD-SPRAY` | One source failing logons as ≥5 different accounts; *high* if a logon from it then succeeds |
+| `KERBEROASTING` | RC4 service tickets (4769) for user service accounts; *high* at ≥3 services from one requester |
+
+Host-rule suppressions: no generic "service installed" rule (drivers and updates install weekly); machine accounts (`NAME$`) and service logons never complete a brute force; RC4 tickets for machine accounts and `krbtgt` are routine; a success *before* the failures is not a brute-force success. On a real Windows 11 workstation's System and PowerShell logs (46 service installs, 120 script blocks) the host rules raised nothing.
+
+Three deliberate suppressions, because a rule that cries wolf is worse than no rule:
+
+- **A 0-second interval is not "periodic", it is simultaneous.** A burst of parallel flows is one burst, not a beacon.
+- **A chunked upload is regular by nature** but it is an exfiltration, not an implant checking in. Volume separates them.
+- **One activity, one finding.** A transfer already reported as bulk is not *also* reported as a beacon.
+
+### How credentials are handled
+
+Normalized events carry no payload by design, so a credential is invisible to a rule reading events — only the parser, holding the dissected packet, ever sees one. The tshark engine therefore emits a `credential_exposure` event carrying a **SHA-256 of the secret, never the secret**.
+
+That is enough to answer *"is this the same credential seen elsewhere"* — which is what makes `CREDENTIAL-REUSE` possible — without putting a working password into a case database that then rides along in every export, report and backup. The plaintext stays in the evidence file, which is already hashed, read-only, and reachable through [content search](#content-search).
+
+**Both engines produce it.** The rules live in `parsers/credentials.py`, which imports only the standard library, so the tshark engine (reading dissected fields) and the scapy engine (reading raw payload) share one vocabulary and one hash function. They were duplicated once and drifted — credential detection existed in tshark and silently did not exist in scapy — so a parity test now asserts the two engines report the same credentials from the same capture, and the sample incident is run through both.
+
+Covered: HTTP form bodies, HTTP query strings, HTTP Basic (decoded to name the account), FTP, POP3, IMAP `LOGIN`, and SMTP `AUTH PLAIN`. **Telnet is deliberately not covered** — it negotiates in-band and sends a character per packet, so a line-oriented reader produces confident nonsense on it.
+
+Only client-to-server payloads are scanned. A login *form* in an HTTP response carries the field names with no values, and reporting the page that asks for a password as a password crossing the network is exactly the false positive that teaches people to ignore a rule.
+
+
+## MITRE ATT&CK mapping
+Deterministic, rule-based, evidence-cited suggestions — never an automated "this happened" claim. Currently T1059, T1059.001, T1027, T1105. Each carries an investigator-settable status (`potential` / `confirmed` / `rejected`) that survives re-scans.
+
+## Investigation
+`trusttrace investigate <entity>` returns everything the case knows about one IP, user, hash, host, domain, process, file, or device: related evidence, a scoped timeline, ranked related entities, a 1-hop relationship graph, and deterministic leads — plus optional threat-intel and AI enrichment.
+
+## Indicator matching
+Import a threat-intelligence feed into a case, and every indicator the evidence touches becomes a detection. That means it leads the story, appears in the report, and survives the next `analyze`. **No network access:** a feed is a file you supply, never one this fetches.
+
+| Format | What is read |
+|---|---|
+| Plain text | One indicator per line; `#` comments and inline `value  # note` |
+| CSV | A header naming the value, type and description columns — or headerless rows of `indicator, note` |
+| STIX 2.1 | `indicator` patterns made of single or OR'd comparisons, plus bare observables |
+| MISP JSON | Event exports, including objects and composite types such as `filename\|sha256` |
+
+Types: IPv4/IPv6 addresses and networks, domains, URLs, MD5, SHA-1, SHA-256, and email addresses.
+
+How it behaves, and why:
+
+- **Defanged values are refanged.** `hxxp://evil[.]com` is how indicators arrive from reports. Stored verbatim, it would import cleanly and never match anything.
+- **A domain matches its subdomains.** An indicator for `evil.top` catches `cdn.evil.top`, which is how the same infrastructure usually shows up in traffic.
+- **One detection per indicator, not per packet.** It says how many events touched the indicator, over what time span, and in which fields — rather than thousands of identical rows.
+- **Severity reflects what a match proves.** Hashes, URLs and domains are *high*. Addresses are *medium*, because shared hosting and CDNs put unrelated sites behind one IP.
+- **Refused lines say why.** Networks broader than /16 (IPv4) or /48 (IPv6), loopback, single-label names, and hashes whose declared type disagrees with their length are refused and listed. A single stray `10.0.0.0/8` would otherwise flag every internal flow.
+- **Compound STIX patterns are refused, not split.** `[a] AND [b]` means both together; importing *a* and *b* separately would match far more than the author meant.
+- **MISP `to_ids = false` is honoured.** That flag is the feed author marking context that should not alert — skipped attributes are counted, not silently dropped.
+- **The feed is recorded by hash.** Each import writes the feed's SHA-256 to the chain of custody, so *"matched against campaign.txt"* stays verifiable long after the file has been renamed or replaced.
+
+A match says a value was reported as malicious *somewhere*. The detection and the story both say so, and ask for it to be confirmed here.
+
+## Threat intelligence
+Optional, explicit, cached VirusTotal lookups for IPs and file hashes. Never automatic, never sent evidence content, cached in the case so repeat runs don't re-query. Values are validated as a real IP or MD5/SHA-1/SHA-256 before anything is sent.
+
+## AI assistant
+Optional, never on the critical path. Four interchangeable providers — **Anthropic, OpenAI, Ollama (fully local), Google Gemini** — selected per request. See [AI safety model](#ai-safety-model).
+
+**Choosing where it runs.** The first-run screen and the top of **Settings** ask one question - *how should the AI assistant run?* - with three answers:
+
+- **On this computer (local AI)** - private (evidence never leaves the machine) and free. The page detects whether Ollama is running and lists the installed models to pick from; if it is not, it gives the setup steps (install Ollama, `ollama pull llama3.1:8b`, check again) with recommended models and their download size and RAM needs.
+- **With an AI service (API key)** - pick Anthropic, OpenAI or Gemini, paste one key, **Save and test** (one real request confirms the service accepts it), with a link to where that service issues keys.
+- **No AI for now** - the page says plainly what still works without it: detections, What happened, recovered files, conversations, the timeline and reports.
+
+The status bar always shows where the assistant runs (*AI: local (qwen2.5:7b)*, *AI: Google Gemini*, *AI: not set up*) and links to change it. Detection comes from `GET /api/ai/status`, which never returns a key and checks an Ollama address through the same loopback-only guard as every Ollama call. The default Ollama address is `http://127.0.0.1:11434`: on Windows `localhost` tries IPv6 first and costs about two seconds per request.
+
+Two shapes, one contract. `investigate --ai` hands a fixed set of events to the model and gets back one hedged hypothesis. `chat` lets the model **retrieve** instead:
+
+```bash
+trusttrace chat --case INC-0001 "was anything downloaded from an external host?"
+trusttrace chat --case INC-0001                    # interactive
+```
+
+It cannot see the evidence. It reaches it through eight read-only tools — content search, stream following, stream listing, event search, detections, entities, protocol summary, evidence listing — and **every tool call appends what it returned to a citation ledger.** The answer must cite from that ledger and nothing else.
+
+Membership is an exact test on the `(kind, evidence_id, reference)` triple, not a substring search of the transcript: a looser check would accept the model quoting an identifier back out of *its own earlier reasoning*, which is the failure being guarded against. An unverifiable citation gets one correction pass naming exactly what failed; if it comes back unverifiable again the **whole answer is refused**, not shown with a caveat.
+
+### Investigation team
+
+`chat` answers one question. `team` runs **specialist analysts** over the whole case, each with its own mission and a scoped subset of the same read-only tools, and merges what they find:
+
+```bash
+trusttrace team --case INC-0001                              # every role whose evidence is present
+trusttrace team --case INC-0001 --roles network --ai-provider ollama
+trusttrace team --case INC-0001 --save-findings              # record results as Open findings
+trusttrace team --case INC-0001 --json
+```
+
+| Role | Reads | Looks for |
+|---|---|---|
+| `network` | pcap, Suricata, JSON/CSV | C2 and beaconing, rare/cheap-TLD domains, exfiltration-shaped transfers, cleartext credentials |
+| `host` | EVTX/Sysmon, JSON/CSV | Process chains, dropped files, persistence, logon bursts, credential access, lateral movement |
+
+- **Same contract as `chat`, per finding.** Each role reports structured findings (`title`, `severity`, `confidence`, `assessment`, `citations`). A finding citing anything its role's tools did not return is **dropped**, and the output says how many were.
+- **Scoped to the evidence.** A role with nothing to read (the host analyst on a pcap-only case) is skipped *before* any model call, and listed as skipped. An explicit `--roles` is run as asked.
+- **Merged on evidence, not wording.** Findings from different roles that cite the same event become one finding that names every role that reported it, ranked by severity and then by how many roles corroborate it.
+- **Proposals, not verdicts.** Nothing is written unless you pass `--save-findings`, and even then each is recorded as an **Open** finding carrying its event citations and "Proposed by the investigation team", for you to confirm or reject.
+- **Bounded.** Each role gets a tool-call budget (`--max-steps`, default 6). Roles run one after another, so cost and logs are predictable.
+- **Recorded.** Case content goes to the provider, so every run is written to the chain of custody (`ai.team_run`: provider, model, roles run and skipped, findings, outcome), as `investigate --ai` is.
+
+**In the web UI**, *Investigation team* (under Assistant) runs the same team in the background: pick the analysts, provider and budget, watch each analyst's progress, and **Accept as finding** on the results you agree with. Each acceptance creates an Open finding; a re-run keeps findings you already accepted marked (matched on the evidence they cite, not their wording), so the same evidence is never one click from a duplicate. Model-written text is rendered as text, never as HTML.
+
+The loop is JSON the model returns rather than four native tool-calling integrations. Each provider expresses tool use differently, so native support would put the safety-critical path in four places and leave **Ollama** — the only provider that keeps an investigation entirely off the network — worst supported. The transport is not what makes this safe; the ledger is.
+
+## Plain language for newcomers
+
+Wireshark's vocabulary is exact and, to someone new, opaque. `core/explain.py` is the one place that turns it into words - deterministic and offline, so it can be trusted the way the detections are:
+
+- **Every conversation says what it was**, e.g. *"10.10.4.17 (on your network) sent 5.0 KB to 104.21.7.19 (on the internet) using FTP-DATA."* - who talked to whom, whether each side is local, on the internet or a reserved address, and which way the data mostly went (bytes are counted per direction). Supporting points say what the protocol is for, whether the content can be read on the wire, and when data mostly left the network.
+- **A glossary of ~50 protocols** - every protocol name in Conversations and Triage opens to a one-line explanation and whether it is encrypted. Event types read as plain labels in the Timeline (*"Unusual packet (statistical outlier)"* instead of `anomaly`), and times are shown as labelled UTC.
+- **Opening a conversation** shows the explanation, hints about what it carried (email addresses, a login sent as plain text, a private key), **Explain this conversation with AI** (the cited assistant - optional), and the Wireshark details (stream index, filter, packet counts) folded underneath rather than first.
+- `trusttrace stream list` prints the same sentence under each row.
+
+## Recovered files
+
+Every file the analysis recovers from traffic is listed under **Recovered files**, in words someone new can follow:
+
+- **What it really is**, decided from its content, not its name — a `report.pdf` that starts with `MZ` is called out as a disguised Windows program.
+- **Where it came from** — *"Sent from 10.10.4.17 to 104.21.7.19 over FTP"*, the URL for web downloads, and a link to the conversation it travelled in.
+- **How risky it is to open** — *Could run code* (programs, scripts, disguised or double-extension files), *Handle with care* (PDFs, Office files with possible macros, archives, HTML/SVG), *Low risk* — each with the reason. Content hints flag private keys, lists of email addresses and password fields.
+- **Look inside safely** — text, CSV as a table, PNG/JPEG/GIF/WebP images, or a hex dump for anything else. Nothing is ever run or rendered as HTML: SVG and HTML are shown as text, and only raster images are served inline.
+- **Download a copy** — always as an attachment (`application/octet-stream`, `nosniff`, a sandboxing CSP), with a second confirmation for anything that can run code. Each download is recorded in the chain of custody (`artifact.exported`) with the file's SHA-256.
+
+Any conversation can also be saved byte-for-byte from **Conversations** (*Save what … sent*), for files in protocols the automatic recovery does not cover; that is recorded too (`stream.exported`).
+
+## Findings & reporting
+Investigator-owned findings (`Open` / `Investigating` / `Confirmed` / `Rejected` / `False Positive` / `Resolved`), each citing specific evidence + event pairs, creatable from CLI or web UI. Reports render to **Markdown, JSON, and HTML**, every section traceable to evidence, with a stated limitations section.
+
+## Web UI
+A dependency-free frontend (no CDN, no build step — works offline) over the same core modules the CLI uses:
+
+The rail groups destinations by the stage of an investigation rather than listing them flat:
+
+| | |
+|---|---|
+| **Evidence** | Evidence · Recovered files · Live capture |
+| **Dig** | Search · Conversations · Triage |
+| **Analysis** | Timeline · Entities · Detections · ATT&CK |
+| **Conclude** | Findings · Reports · Chain of custody |
+| **Assistant** | Ask (cited) · Investigation team |
+
+The **Overview is a dashboard**: KPI tiles, an analysis runner reporting *in progress / complete / completed-with-errors* (per-evidence failures listed individually — a partially-failed analyze is not a success), an event-density chart, top entities, a one-hop entity graph, recent detections, carved files, triage matches, an ask box, and the custody trail with its verification state. Charts are inline SVG: no build step, no CDN, works offline.
+
+Surfaces that need tshark are **dimmed and explained, never hidden** — a missing item reads as a missing feature, a disabled one reads as a setup step. The rail carries live capture status; the status bar reports which Wireshark tools were actually detected.
+
+## Live capture
+Rotating pcap capture that auto-ingests each finished window through the **exact same pipeline** as a manually added file — including detection rules, so a match surfaces as an alert within one poll. That makes it a lightweight live-alerting mode with no separate "watch" step.
+
+| Backend | Notes |
+|---|---|
+| `dumpcap` | Wireshark's capture engine, preferred when installed. Does the packet copying and the rotation itself, in C, using its own ring buffer — so no packet is lost at a window boundary the way a Python-side rotation can lose one. It is also the one small program Wireshark isolates capture privileges into. |
+| `scapy` | Pure-Python fallback. Every packet crosses into Python to be written, which is what limits it on a busy link. |
+
+With dumpcap present, `--list-interfaces` also shows Wireshark's human-readable interface descriptions — which is what makes a Windows `\Device\NPF_{GUID}` identifiable as a particular NIC.
+
+> Requires a packet-capture driver (Npcap / libpcap) and elevated privileges. This tool installs neither and grants neither.
+
+## Case portability
+Export a whole case to one zip archive with a SHA-256 manifest of every file. Import verifies **every** file against that manifest before writing anything, so a tampered or corrupted archive is rejected outright rather than partially extracted.
+
+---
+
+# AI safety model
+
+The AI assistant is the **last, optional** step in the pipeline — never a replacement for any step before it. Providers are interchangeable: Anthropic, OpenAI, a local Ollama server, or Google Gemini.
+
+Every property below is enforced **in code**, identically regardless of which provider answered:
+
+- It only ever sees already-normalized `Event` data for the entity you investigated — **never raw evidence file contents**, and nothing outside that scope.
+- Its response is a fixed schema, not free text: `evidence_sufficient`, `claim` (phrased as a possibility), `observed_evidence` (fact, kept separate from interpretation), `confidence`, `alternative_explanation`, `recommended_validation`, `evidence` (the exact evidence/event pairs cited).
+- **Every citation is checked against the events actually sent.** A hypothesis citing anything not in that set is rejected outright and never shown. This is code, not a prompt instruction.
+- **It never writes a finding.** Turning a hypothesis into one is always an explicit investigator action.
+- Every request and its outcome — including refusals and failures — is recorded in the chain of custody: `ai.hypothesis_requested` (`investigate --ai` and the web hypothesis button: provider, model, entity, events sent, confidence, cited events), `ai.chat_requested` (`chat` and web *Ask*: provider, model, the question, tools called, citations, answered / refused / failed) and `ai.team_run`. API keys are never recorded.
+
+Verified against a live API, not only mocks: a real Gemini response returned citations that passed the contract check, with all safety properties intact.
+
+Transient provider failures (overload, rate limiting) are retried with backoff. Credential errors and retired-model errors are **not** retried — they fail identically every time, so retrying only delays a clear message.
+
+---

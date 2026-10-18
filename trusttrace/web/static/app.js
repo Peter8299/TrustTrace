@@ -1,0 +1,4778 @@
+const API = "/api";
+
+let _capturePollTimer = null;
+
+function stopCapturePolling() {
+  if (_capturePollTimer) {
+    clearInterval(_capturePollTimer);
+    _capturePollTimer = null;
+  }
+}
+
+async function apiGet(path) {
+  const res = await fetch(API + path);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+// Sent on every state-changing request - see the CSRF paragraph in
+// web/app.py's module docstring. The server rejects POST/PUT/PATCH/DELETE
+// without it.
+const CSRF_HEADERS = { "X-Requested-With": "TrustTrace" };
+
+async function apiPost(path, body) {
+  const res = await fetch(API + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...CSRF_HEADERS },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function apiDelete(path, body) {
+  const res = await fetch(API + path, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json", ...CSRF_HEADERS },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function apiUpload(path, formData) {
+  // No Content-Type header: the browser sets multipart/form-data with the
+  // correct boundary itself when the body is a FormData instance.
+  const res = await fetch(API + path, { method: "POST", body: formData, headers: CSRF_HEADERS });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "text") e.textContent = v;
+      else if (k === "html") e.innerHTML = v;
+      else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    }
+  }
+  // Accessibility: a field with only a placeholder has no accessible name
+  // for a screen reader (a placeholder is not a label). Mirror it unless a
+  // name is already provided some other way.
+  if (
+    (tag === "input" || tag === "textarea") &&
+    e.placeholder &&
+    !e.getAttribute("aria-label") &&
+    !e.getAttribute("aria-labelledby") &&
+    !e.id
+  ) {
+    e.setAttribute("aria-label", e.placeholder);
+  }
+  if (children) for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
+function cssClass(s) {
+  return String(s == null ? "" : s).replace(/\s+/g, "-");
+}
+
+function toast(message, isError) {
+  const t = document.getElementById("toast");
+  t.textContent = message;
+  t.className = "toast" + (isError ? " error" : "");
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => {
+    t.hidden = true;
+  }, 4000);
+  announce(message, isError);
+}
+
+// Speak a message to screen-reader users. The text is cleared first and
+// set a moment later so that the same message twice is announced twice.
+function announce(message, urgent) {
+  const region = document.getElementById(urgent ? "announce-urgent" : "announce-polite");
+  if (!region) return;
+  region.textContent = "";
+  clearTimeout(region._t);
+  region._t = setTimeout(() => {
+    region.textContent = message;
+  }, 60);
+}
+
+// --- Router ---
+
+window.addEventListener("hashchange", () => {
+  const target = location.hash;
+  route().then(() => {
+    // A slow page can finish after the user has moved on - to another
+    // page, or into this one. Only take focus if they have not.
+    const active = document.activeElement;
+    const userMoved = active && active !== document.body && document.getElementById("app").contains(active);
+    afterNavigate(location.hash === target && !userMoved);
+  });
+});
+window.addEventListener("DOMContentLoaded", () => route().then(() => afterNavigate(false)));
+window.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("skip-link")?.addEventListener("click", (ev) => {
+    ev.preventDefault(); // "#app" is not a route
+    focusMain();
+  });
+});
+
+function focusMain() {
+  const app = document.getElementById("app");
+  // The page heading when there is one, so a screen reader starts by
+  // reading where the user is; otherwise the page itself.
+  const heading = app.querySelector("h1");
+  if (heading) {
+    heading.setAttribute("tabindex", "-1");
+    heading.focus();
+  } else {
+    app.focus();
+  }
+}
+
+// A single-page app does not tell a screen reader that the page changed:
+// name the page in the title and, when the user navigated, move focus to
+// it instead of leaving it on the link they followed in the rail.
+function afterNavigate(moveFocus) {
+  const heading = document.querySelector("#app h1");
+  const name = heading ? heading.textContent.trim() : "";
+  document.title = name ? `${name} · TrustTrace` : "TrustTrace";
+  if (moveFocus) focusMain();
+}
+
+function parseHash() {
+  return location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+}
+
+async function route() {
+  // Modals attach to document.body, so clearing #app does not remove
+  // them. Left open across a navigation, a pivot dialog goes on showing
+  // one case's evidence over another case's page - in a forensics tool
+  // that is not untidy, it is wrong.
+  for (const modal of document.querySelectorAll(".modal")) modal.remove();
+
+  const parts = parseHash();
+  const nav = document.getElementById("case-nav");
+  const app = document.getElementById("app");
+
+  const switcher = document.getElementById("case-switch");
+  const captureCard = document.getElementById("capture-card");
+
+  if (parts[0] === "case" && parts[1]) {
+    const caseId = parts[1];
+    const tab = parts[2] || "overview";
+    app.innerHTML = "";
+    try {
+      const c = await apiGet(`/cases/${caseId}`);
+      // The rail is drawn from the tshark status so the surfaces that
+      // need it can be disabled with a reason rather than hidden.
+      renderRail(caseId, tab, await wiresharkStatus());
+      await renderCaseSwitch(c);
+      renderStatusBar(c);
+      renderCaptureCard(caseId);
+      await renderCaseTab(app, c, tab, parts.slice(3));
+    } catch (e) {
+      nav.hidden = true;
+      app.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  } else if (parts[0] === "settings") {
+    stopCapturePolling();
+    renderHomeRail("settings");
+    switcher.innerHTML = "";
+    captureCard.innerHTML = "";
+    app.innerHTML = "";
+    renderStatusBar(null);
+    await renderSettings(app);
+  } else {
+    renderHomeRail("home");
+    switcher.innerHTML = "";
+    captureCard.innerHTML = "";
+    renderStatusBar(null);
+    await renderCaseList(app);
+  }
+}
+
+// --- Settings (API keys + provider preferences) ---
+
+const SECRET_FIELDS = [
+  ["virustotal_api_key", "VirusTotal API key", "Threat-intel lookups for IPs and file hashes"],
+  ["anthropic_api_key", "Anthropic API key", "AI assistant - Claude"],
+  ["openai_api_key", "OpenAI API key", "AI assistant - GPT"],
+  ["gemini_api_key", "Gemini API key", "AI assistant - Google"],
+];
+
+async function renderSettings(app) {
+  app.appendChild(el("h1", { text: "Settings" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Optional API keys, saved once instead of passed on every command. Stored outside your cases " +
+        "directory, so they are never included in a `case export` archive. Everything here is optional - " +
+        "parsing, correlation, timeline, and the bundled detection rules all work fully offline without any key.",
+    })
+  );
+
+  const aiPanel = el("section", { class: "panel ai-setup-card", "aria-labelledby": "ai-setup-title" });
+  aiPanel.appendChild(el("h2", { id: "ai-setup-title", text: "How should the AI assistant run?" }));
+  const aiBody = el("div");
+  aiPanel.appendChild(aiBody);
+  app.appendChild(aiPanel);
+  renderAiSetup(aiBody, { onDone: () => renderStatusBar(null) });
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+  panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+
+  let data;
+  try {
+    data = await apiGet("/settings");
+  } catch (e) {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    return;
+  }
+
+  panel.innerHTML = "";
+  panel.appendChild(el("h3", { text: "API Keys" }));
+  const inputs = {};
+
+  for (const [key, label, help] of SECRET_FIELDS) {
+    const info = data.secrets[key] || {};
+    const row = el("div", { class: "setting-row" });
+    row.appendChild(el("label", { text: label }));
+    const input = el("input", {
+      type: "password",
+      placeholder: info.set ? `Saved (${info.hint}) - type to replace` : help,
+    });
+    inputs[key] = input;
+    row.appendChild(input);
+
+    const status = el("span", {
+      class: "setting-status" + (info.set ? " is-set" : ""),
+      text: info.set ? `set via ${info.source}` : "not set",
+    });
+    row.appendChild(status);
+    panel.appendChild(row);
+
+    if (info.overridden_by_env) {
+      panel.appendChild(
+        el("div", {
+          class: "setting-note",
+          text: `${info.env_var} is set in your environment and takes priority over anything saved here.`,
+        })
+      );
+    }
+  }
+
+  panel.appendChild(el("h3", { text: "AI Defaults", style: "margin-top:18px;" }));
+
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"], default_models: {} };
+  try {
+    providerInfo = await apiGet("/ai-providers");
+  } catch (e) {
+    /* keep the fallback list */
+  }
+
+  const providerRow = el("div", { class: "setting-row" });
+  providerRow.appendChild(el("label", { text: "Default AI provider" }));
+  const providerSelect = selectEl(providerInfo.providers, data.preferences.ai_provider || "anthropic");
+  providerRow.appendChild(providerSelect);
+  providerRow.appendChild(el("span", { class: "setting-status", text: "" }));
+  panel.appendChild(providerRow);
+
+  const modelRow = el("div", { class: "setting-row" });
+  modelRow.appendChild(el("label", { text: "Default model (optional)" }));
+  const modelInput = el("input", {
+    type: "text",
+    value: data.preferences.ai_model || "",
+    placeholder: "Leave blank to use each provider's default",
+  });
+  modelRow.appendChild(modelInput);
+  modelRow.appendChild(el("span", { class: "setting-status", text: "" }));
+  panel.appendChild(modelRow);
+
+  const ollamaRow = el("div", { class: "setting-row" });
+  ollamaRow.appendChild(el("label", { text: "Ollama server URL" }));
+  const ollamaInput = el("input", {
+    type: "text",
+    value: data.preferences.ollama_base_url || "",
+    placeholder: "http://127.0.0.1:11434",
+  });
+  ollamaRow.appendChild(ollamaInput);
+  ollamaRow.appendChild(el("span", { class: "setting-status", text: "" }));
+  panel.appendChild(ollamaRow);
+
+  // --- performance (advanced) ---
+  // DuckDB sizes memory and threads itself by default, which is right for a
+  // dedicated machine. These bound it on a shared or constrained host.
+  panel.appendChild(el("h3", { text: "Performance (advanced)", style: "margin-top:18px;" }));
+  panel.appendChild(
+    el("div", {
+      class: "setting-note",
+      text: "Leave blank to let DuckDB size itself (about 80% of RAM, one thread per core). Set these only to bound the tool on a shared or memory-limited machine.",
+    })
+  );
+
+  const memRow = el("div", { class: "setting-row" });
+  const memInput = el("input", {
+    type: "text",
+    id: "set-duckdb-memory",
+    value: data.preferences.duckdb_memory_limit || "",
+    placeholder: "e.g. 2GB (blank = automatic)",
+    "aria-label": "DuckDB memory limit",
+  });
+  memRow.appendChild(el("label", { text: "Memory limit", for: "set-duckdb-memory" }));
+  memRow.appendChild(memInput);
+  memRow.appendChild(el("span", { class: "setting-status", text: "" }));
+  panel.appendChild(memRow);
+
+  const threadsRow = el("div", { class: "setting-row" });
+  const threadsInput = el("input", {
+    type: "text",
+    id: "set-duckdb-threads",
+    inputmode: "numeric",
+    value: data.preferences.duckdb_threads || "",
+    placeholder: "e.g. 4 (blank = all cores)",
+    "aria-label": "DuckDB worker threads",
+  });
+  threadsRow.appendChild(el("label", { text: "Worker threads", for: "set-duckdb-threads" }));
+  threadsRow.appendChild(threadsInput);
+  threadsRow.appendChild(el("span", { class: "setting-status", text: "" }));
+  panel.appendChild(threadsRow);
+
+  const actions = el("div", { class: "filter-bar", style: "margin-top:16px;" });
+  const saveBtn = el("button", { text: "Save Settings" });
+  actions.appendChild(saveBtn);
+  panel.appendChild(actions);
+
+  panel.appendChild(
+    el("div", {
+      class: "subtitle",
+      style: "margin-top:6px; font-size:12px;",
+      text: `Saved to ${data.config_path}`,
+    })
+  );
+
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    try {
+      const body = {
+        ai_provider: providerSelect.value,
+        ai_model: modelInput.value.trim(),
+        ollama_base_url: ollamaInput.value.trim(),
+        duckdb_memory_limit: memInput.value.trim(),
+        duckdb_threads: threadsInput.value.trim(),
+      };
+      // Only send keys the user actually typed into: an untouched field
+      // must leave the saved key alone, not clear it.
+      for (const [key] of SECRET_FIELDS) {
+        if (inputs[key].value.trim()) body[key] = inputs[key].value.trim();
+      }
+      await apiPost("/settings", body);
+      toast("Settings saved.");
+      // Re-render from the server's masked view so the fields show the
+      // newly-saved state (and clear the plaintext the user just typed).
+      const container = document.getElementById("app");
+      container.innerHTML = "";
+      await renderSettings(container);
+    } catch (e) {
+      toast("Save failed: " + e.message, true);
+      saveBtn.disabled = false;
+    }
+  });
+
+  // --- connection tests ---
+  panel.appendChild(el("h3", { text: "Test Connections", style: "margin-top:18px;" }));
+  panel.appendChild(
+    el("div", {
+      class: "subtitle",
+      style: "font-size:12px;",
+      text: "Makes one real request to confirm a credential works, rather than finding out mid-investigation.",
+    })
+  );
+  const testBar = el("div", { class: "filter-bar" });
+  const testResult = el("div", { style: "margin-top:8px;" });
+  for (const target of ["virustotal", "anthropic", "openai", "gemini", "ollama"]) {
+    const btn = el("button", { class: "secondary", text: target });
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      testResult.innerHTML = "";
+      testResult.appendChild(el("div", { class: "loading", text: `Testing ${target}...` }));
+      try {
+        const r = await apiPost("/settings/test", { target });
+        testResult.innerHTML = "";
+        testResult.appendChild(
+          el("div", { class: r.ok ? "lead" : "error-box", text: `${target}: ${r.message}` })
+        );
+      } catch (e) {
+        testResult.innerHTML = "";
+        testResult.appendChild(el("div", { class: "error-box", text: `${target}: ${e.message}` }));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    testBar.appendChild(btn);
+  }
+  panel.appendChild(testBar);
+  panel.appendChild(testResult);
+}
+
+async function renderCaseTab(app, c, tab, rest) {
+  stopCapturePolling(); // leaving (or re-rendering) any tab cancels a live capture-status poll loop
+  stopTeamPolling(); // same for a team run; the run itself carries on server-side
+  if (tab === "story") return renderStory(app, c);
+  if (tab === "evidence") return renderEvidence(app, c);
+  if (tab === "files") return renderFiles(app, c, rest.length ? decodeURIComponent(rest.join("/")) : undefined);
+  if (tab === "timeline") return renderTimeline(app, c);
+  if (tab === "entities") return renderEntities(app, c, rest[0]);
+  if (tab === "host") return renderHostDossier(app, c, rest[0]);
+  if (tab === "findings") return renderFindings(app, c);
+  if (tab === "audit") return renderAudit(app, c);
+  if (tab === "detections") return renderDetections(app, c);
+  if (tab === "iocs") return renderIocs(app, c);
+  if (tab === "attack") return renderAttack(app, c);
+  if (tab === "reports") return renderReports(app, c);
+  if (tab === "capture") return renderCapture(app, c);
+  if (tab === "search") return renderSearch(app, c);
+  if (tab === "streams") return renderStreams(app, c, rest[0]);
+  if (tab === "triage") return renderTriage(app, c);
+  if (tab === "chat") return renderChat(app, c);
+  if (tab === "team") return renderTeam(app, c);
+  return renderOverview(app, c);
+}
+
+// --- Case list ---
+
+// ===================================================================
+// Home: the first screen, and the way into a new investigation.
+// ===================================================================
+//
+// The first screen used to be a heading and a bare list - and when the
+// list was empty it told the user to open a terminal and run
+// `trusttrace case create`. A web app whose front door is a CLI command
+// is not one anyone new can use. It now starts an investigation (details,
+// evidence, analysis) in one step, and shows each case's state at a
+// glance, so the case that needs attention is findable without opening
+// every one of them.
+
+const EVIDENCE_ACCEPT = ".pcap,.pcapng,.evtx,.json,.csv";
+const SEVERITY_ORDER = { critical: 4, high: 3, medium: 2, low: 1, none: 0 };
+
+function renderHomeRail(active) {
+  const nav = document.getElementById("case-nav");
+  nav.innerHTML = "";
+  nav.hidden = false;
+  nav.appendChild(el("div", { class: "rail-group", text: "Workspace" }));
+  const items = [
+    ["home", "#/", "Investigations", ICONS.folder],
+    ["settings", "#/settings", "Settings", ICONS.gear],
+  ];
+  for (const [key, href, label, iconPath] of items) {
+    const link = el("a", { href, class: "rail-link" + (key === active ? " active" : "") });
+    if (key === active) link.setAttribute("aria-current", "page");
+    link.appendChild(icon(iconPath));
+    link.appendChild(document.createTextNode(label));
+    nav.appendChild(link);
+  }
+}
+
+function relativeDay(iso) {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (isNaN(then.getTime())) return "";
+  const days = Math.floor((Date.now() - then.getTime()) / 86400000);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} days ago`;
+  return then.toISOString().slice(0, 10);
+}
+
+function fmtBytes(n) {
+  if (!n && n !== 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v < 10 && i ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+function field(label, control, id, hint) {
+  const wrap = el("div", { class: "field" }, [el("label", { for: id, text: label }), control]);
+  if (hint) wrap.appendChild(el("div", { class: "field-hint", text: hint }));
+  return wrap;
+}
+
+async function renderCaseList(app) {
+  app.innerHTML = "";
+
+  const head = el("div", { class: "home-head" });
+  head.appendChild(
+    el("div", {}, [
+      el("h1", { text: "Investigations" }),
+      el("div", {
+        class: "subtitle",
+        text: "Each case keeps its evidence, analysis, findings and chain of custody together - on this machine.",
+      }),
+    ])
+  );
+  const newBtn = el("button", { class: "primary", type: "button", onclick: () => openNewCaseModal() });
+  newBtn.appendChild(icon(ICONS.plus, { size: 15, width: 2.2 }));
+  newBtn.appendChild(document.createTextNode("New investigation"));
+  const headActions = el("div", { class: "home-head-actions" }, [newBtn]);
+  head.appendChild(headActions);
+  app.appendChild(head);
+
+  const body = el("div");
+  app.appendChild(body);
+  body.appendChild(el("div", { class: "loading", text: "Loading cases…" }));
+
+  let cases;
+  try {
+    cases = await apiGet("/cases");
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "error-box", text: "Could not load cases: " + e.message }));
+    return;
+  }
+  body.innerHTML = "";
+
+  if (!cases.length) {
+    // The onboarding card carries its own call to action; two identical
+    // buttons on an otherwise empty screen compete for no reason.
+    headActions.hidden = true;
+    body.appendChild(renderOnboarding());
+    // Optional, and after the main call to action: the question every new
+    // user has about AI, answered before they meet it inside a case.
+    const aiCard = el("section", { class: "panel ai-setup-card", "aria-labelledby": "ai-setup-title" });
+    aiCard.appendChild(el("h2", { id: "ai-setup-title", text: "How should the AI assistant run? (optional)" }));
+    const aiBody = el("div");
+    aiCard.appendChild(aiBody);
+    body.appendChild(aiCard);
+    renderAiSetup(aiBody);
+    return;
+  }
+
+  const toolbar = el("div", { class: "home-toolbar" });
+  const search = el("input", {
+    type: "search",
+    placeholder: "Search by name, case ID or investigator",
+    "aria-label": "Search cases",
+  });
+  toolbar.appendChild(search);
+
+  const counts = { all: cases.length, open: 0, investigating: 0, closed: 0 };
+  for (const c of cases) counts[c.status] = (counts[c.status] || 0) + 1;
+  const seg = el("div", { class: "seg", role: "group", "aria-label": "Filter by status" });
+  let status = "all";
+  for (const key of ["all", "open", "investigating", "closed"]) {
+    const b = el("button", { type: "button", class: "seg-btn" + (key === "all" ? " on" : "") });
+    b.setAttribute("aria-pressed", String(key === "all"));
+    b.appendChild(document.createTextNode(key[0].toUpperCase() + key.slice(1)));
+    b.appendChild(el("span", { class: "seg-n", text: String(counts[key] || 0) }));
+    b.onclick = () => {
+      status = key;
+      for (const other of seg.querySelectorAll(".seg-btn")) {
+        other.classList.toggle("on", other === b);
+        other.setAttribute("aria-pressed", String(other === b));
+      }
+      draw();
+    };
+    seg.appendChild(b);
+  }
+  toolbar.appendChild(seg);
+  body.appendChild(toolbar);
+
+  // Attention first: active cases before closed ones, the most severe
+  // story first, then the most recently touched.
+  const ordered = [...cases].sort((a, b) => {
+    const closed = Number(a.status === "closed") - Number(b.status === "closed");
+    if (closed) return closed;
+    const sev = (SEVERITY_ORDER[b.severity] || 0) - (SEVERITY_ORDER[a.severity] || 0);
+    if (sev) return sev;
+    return String(b.updated_at || "").localeCompare(String(a.updated_at || ""));
+  });
+
+  const list = el("div", { class: "case-list" });
+  body.appendChild(list);
+
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    list.innerHTML = "";
+    const shown = ordered.filter(
+      (c) =>
+        (status === "all" || c.status === status) &&
+        (!q || [c.name, c.case_id, c.investigator, c.description].some((v) => String(v || "").toLowerCase().includes(q)))
+    );
+    if (!shown.length) {
+      list.appendChild(
+        el("div", {
+          class: "empty",
+          text: q ? `No case matches "${search.value.trim()}".` : `No ${status} cases.`,
+        })
+      );
+      return;
+    }
+    for (const c of shown) list.appendChild(caseRow(c));
+  }
+  search.addEventListener("input", draw);
+  draw();
+}
+
+function renderOnboarding() {
+  const card = el("section", { class: "onboard", "aria-labelledby": "onboard-title" });
+  card.appendChild(el("div", { class: "onboard-eyebrow", text: "Get started" }));
+  card.appendChild(el("h2", { id: "onboard-title", class: "onboard-title", text: "Start your first investigation" }));
+  card.appendChild(
+    el("p", {
+      class: "onboard-lede",
+      text:
+        "Add a packet capture or a log export. TrustTrace parses it, correlates events across sources, runs its " +
+        "detection rules, and tells you what happened - with every line citing the evidence it rests on.",
+    })
+  );
+
+  // A real sequence, so it is numbered: these are the steps, in order.
+  const steps = el("ol", { class: "onboard-steps" });
+  const STEPS = [
+    ["Name the case", "What it is about and who is investigating. Creating it opens the chain of custody."],
+    ["Add evidence", "pcap or pcapng captures, Windows Event Logs (.evtx), or JSON and CSV logs. Each file is hashed and kept read-only."],
+    ["Read what happened", "Analysis runs straight away and opens on the story: the assessment first, then each finding and its evidence."],
+  ];
+  for (const [title, detail] of STEPS) {
+    steps.appendChild(el("li", {}, [el("div", { class: "step-t", text: title }), el("div", { class: "step-d", text: detail })]));
+  }
+  card.appendChild(steps);
+
+  const cta = el("button", { type: "button", class: "primary lg", onclick: () => openNewCaseModal() });
+  cta.appendChild(icon(ICONS.plus, { size: 16, width: 2.2 }));
+  cta.appendChild(document.createTextNode("Start an investigation"));
+  card.appendChild(
+    el("div", { class: "onboard-actions" }, [
+      cta,
+      el("span", { class: "dim", text: "Nothing is uploaded anywhere. Files stay on this machine." }),
+    ])
+  );
+  return card;
+}
+
+function caseRow(c) {
+  const analyzed = c.event_count > 0;
+  const sev = analyzed ? c.severity || "none" : "pending";
+  const row = el("a", {
+    class: "case-row sev-" + cssClass(sev),
+    href: `#/case/${c.case_id}/${analyzed ? "story" : "overview"}`,
+  });
+
+  const main = el("div", { class: "case-row-main" });
+  main.appendChild(
+    el("div", { class: "case-row-title" }, [
+      el("span", { class: "case-row-name", text: c.name }),
+      el("span", { class: "mono case-row-id", text: c.case_id }),
+    ])
+  );
+  const who = c.investigator && c.investigator !== "unknown" ? c.investigator : null;
+  main.appendChild(
+    el("div", { class: "case-row-meta", text: [who, `created ${relativeDay(c.created_at)}`].filter(Boolean).join(" · ") })
+  );
+
+  // The line that answers "why would I open this one": what the story
+  // concluded, or what the case needs before it can conclude anything.
+  let state;
+  let pending = true;
+  if (c.summary_error) state = "This case's analysis could not be read.";
+  else if (!c.evidence_count && !analyzed) state = "No evidence yet - open it to add some.";
+  else if (!analyzed) state = "Evidence added, not analyzed yet.";
+  else {
+    state = c.assessment || c.headline || "";
+    pending = false;
+  }
+  main.appendChild(el("div", { class: "case-row-state" + (pending ? " pending" : ""), text: state }));
+  row.appendChild(main);
+
+  const side = el("div", { class: "case-row-side" });
+  const chips = el("div", { class: "case-row-chips" });
+  if (analyzed) {
+    chips.appendChild(el("span", { class: "badge badge-" + cssClass(sev), text: sev === "none" ? "no detections" : sev }));
+  } else {
+    chips.appendChild(el("span", { class: "badge badge-none", text: c.evidence_count ? "ready to analyze" : "empty" }));
+  }
+  chips.appendChild(el("span", { class: "badge badge-" + cssClass(c.status), text: c.status }));
+  side.appendChild(chips);
+  side.appendChild(
+    el("div", {
+      class: "case-row-counts",
+      text: `${c.evidence_count} evidence · ${c.detection_count} detection${c.detection_count === 1 ? "" : "s"}`,
+    })
+  );
+  row.appendChild(side);
+  return row;
+}
+
+// --- Evidence intake, shared by the new-case dialog and an empty case ---
+
+function evidenceDropzone(onFiles) {
+  const input = el("input", { type: "file", multiple: "", accept: EVIDENCE_ACCEPT, class: "dz-input", tabindex: "-1" });
+  const zone = el("div", { class: "dropzone", role: "button", tabindex: "0", "aria-label": "Add evidence files" });
+  zone.appendChild(icon(ICONS.upload, { size: 22 }));
+  zone.appendChild(el("div", { class: "dz-title", text: "Drop evidence here, or choose files" }));
+  zone.appendChild(el("div", { class: "dz-hint", text: "pcap · pcapng · evtx · json · csv - up to 1 GB each" }));
+  zone.appendChild(input);
+
+  const disabled = () => zone.classList.contains("disabled");
+  const pick = () => {
+    if (!disabled()) input.click();
+  };
+  zone.addEventListener("click", (e) => {
+    // The input sits inside the zone, so its own click bubbles here.
+    if (e.target !== input) pick();
+  });
+  zone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      pick();
+    }
+  });
+  input.addEventListener("change", () => {
+    if (input.files.length) onFiles([...input.files]);
+    input.value = "";
+  });
+  for (const type of ["dragenter", "dragover"]) {
+    zone.addEventListener(type, (e) => {
+      e.preventDefault();
+      if (!disabled()) zone.classList.add("over");
+    });
+  }
+  for (const type of ["dragleave", "drop"]) {
+    zone.addEventListener(type, (e) => {
+      e.preventDefault();
+      zone.classList.remove("over");
+    });
+  }
+  zone.addEventListener("drop", (e) => {
+    if (disabled()) return;
+    const dropped = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    if (dropped.length) onFiles(dropped);
+  });
+  return zone;
+}
+
+// Upload each file, then analyze once. Returns { analyzed, clean }: clean
+// means every file was added and analysis reported no error, which is the
+// only case in which it is right to move the user on without them seeing
+// what happened.
+async function uploadAndAnalyze(caseId, files, progress) {
+  progress.replaceChildren();
+  const rows = files.map((f) => {
+    const status = el("div", { class: "fp-status", text: "Waiting" });
+    const row = el("div", { class: "fp-row" }, [
+      el("span", { class: "fp-name", text: f.name, title: f.name }),
+      el("span", { class: "dim", text: fmtBytes(f.size) }),
+      status,
+    ]);
+    progress.appendChild(row);
+    return { f, row, status };
+  });
+
+  let added = 0;
+  for (const r of rows) {
+    r.row.className = "fp-row active";
+    r.status.textContent = "Uploading and hashing…";
+    try {
+      const form = new FormData();
+      form.append("file", r.f);
+      const evidence = await apiUpload(`/cases/${caseId}/evidence`, form);
+      r.row.className = "fp-row done";
+      r.status.textContent = `Added as ${evidence.evidence_id} (${evidence.evidence_type})`;
+      added += 1;
+    } catch (e) {
+      r.row.className = "fp-row failed";
+      r.status.textContent = e.message;
+    }
+  }
+
+  if (!added) {
+    progress.appendChild(el("div", { class: "error-box", text: "No file could be added, so there is nothing to analyze." }));
+    return { analyzed: false, clean: false };
+  }
+
+  const line = el("div", { class: "fp-analyze", text: "Analyzing - parsing, correlating and running detection rules…" });
+  progress.appendChild(line);
+  try {
+    const result = await apiPost(`/cases/${caseId}/analyze`, {});
+    const failed = (result.results || []).filter((x) => x.error);
+    const analyzed = result.total_events > 0;
+    if (failed.length) {
+      line.className = "error-box";
+      line.textContent =
+        `Analysis finished with ${failed.length} error${failed.length === 1 ? "" : "s"}: ` +
+        failed.map((x) => `${x.evidence_id}: ${x.error}`).join("; ");
+      return { analyzed, clean: false };
+    }
+    line.className = "fp-analyze done";
+    line.textContent = `Analyzed ${result.total_events.toLocaleString()} events - ${result.detection_count} detection${result.detection_count === 1 ? "" : "s"}.`;
+    return { analyzed, clean: added === files.length };
+  } catch (e) {
+    line.className = "error-box";
+    line.textContent = "Analysis failed: " + e.message;
+    return { analyzed: false, clean: false };
+  }
+}
+
+function openNewCaseModal() {
+  const box = el("div", { class: "modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "new-case-title" });
+  const form = el("form", { class: "modal-card wide", novalidate: "" });
+  form.appendChild(el("h3", { id: "new-case-title", text: "New investigation" }));
+  form.appendChild(
+    el("div", { class: "dim modal-lede", text: "Everything you add is hashed on arrival and stays on this machine." })
+  );
+
+  const name = el("input", {
+    id: "nc-name",
+    type: "text",
+    maxlength: "200",
+    autocomplete: "off",
+    placeholder: "e.g. Unusual outbound traffic from a finance laptop",
+  });
+  const investigator = el("input", { id: "nc-investigator", type: "text", maxlength: "120", placeholder: "Your name" });
+  try {
+    investigator.value = localStorage.getItem("nfai.investigator") || "";
+  } catch (e) {
+    /* remembering the name is a convenience; without storage the field is simply empty */
+  }
+  const description = el("textarea", {
+    id: "nc-desc",
+    rows: "2",
+    maxlength: "2000",
+    placeholder: "What prompted it, and what you are looking for",
+  });
+
+  form.appendChild(field("Case name", name, "nc-name"));
+  const pair = el("div", { class: "field-pair" }, [
+    field("Investigator", investigator, "nc-investigator", "Recorded on every action in the chain of custody."),
+    field("Description (optional)", description, "nc-desc"),
+  ]);
+  form.appendChild(pair);
+
+  const files = [];
+  const fileList = el("div", { class: "file-list" });
+  const zone = evidenceDropzone((picked) => {
+    for (const f of picked) {
+      if (!files.some((x) => x.name === f.name && x.size === f.size)) files.push(f);
+    }
+    drawFiles();
+  });
+  const evidenceField = el("div", { class: "field" }, [el("label", { text: "Evidence (optional)" }), zone, fileList]);
+  form.appendChild(evidenceField);
+
+  const progress = el("div", { class: "wizard-progress", "aria-live": "polite" });
+  form.appendChild(progress);
+
+  const cancel = el("button", { type: "button", class: "secondary", text: "Cancel" });
+  const submit = el("button", { type: "submit", class: "primary" });
+  form.appendChild(el("div", { class: "modal-actions" }, [cancel, submit]));
+
+  let busy = false;
+  const close = () => {
+    if (!busy) box.remove();
+  };
+  cancel.onclick = close;
+
+  function drawFiles() {
+    fileList.replaceChildren();
+    files.forEach((f, index) => {
+      const remove = el("button", { type: "button", class: "icon-btn", "aria-label": `Remove ${f.name}`, text: "Remove" });
+      remove.onclick = () => {
+        files.splice(index, 1);
+        drawFiles();
+      };
+      fileList.appendChild(
+        el("div", { class: "file-item" }, [
+          el("span", { class: "fl-name", text: f.name, title: f.name }),
+          el("span", { class: "dim", text: fmtBytes(f.size) }),
+          remove,
+        ])
+      );
+    });
+    submit.textContent = files.length
+      ? `Create and analyze ${files.length} file${files.length === 1 ? "" : "s"}`
+      : "Create investigation";
+  }
+  drawFiles();
+
+  const setBusy = (on) => {
+    busy = on;
+    for (const control of [name, investigator, description, submit, cancel]) control.disabled = on;
+    zone.classList.toggle("disabled", on);
+    for (const b of fileList.querySelectorAll("button")) b.disabled = on;
+  };
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const caseName = name.value.trim();
+    if (!caseName) {
+      name.setAttribute("aria-invalid", "true");
+      progress.replaceChildren(el("div", { class: "error-box", text: "Give the case a name - it is how you will find it later." }));
+      name.focus();
+      return;
+    }
+    name.removeAttribute("aria-invalid");
+    try {
+      localStorage.setItem("nfai.investigator", investigator.value.trim());
+    } catch (e) {
+      /* see above */
+    }
+
+    setBusy(true);
+    progress.replaceChildren(el("div", { class: "loading", text: "Creating the case…" }));
+    let created;
+    try {
+      created = await apiPost("/cases", {
+        name: caseName,
+        investigator: investigator.value.trim(),
+        description: description.value.trim(),
+      });
+    } catch (e) {
+      progress.replaceChildren(el("div", { class: "error-box", text: "Could not create the case: " + e.message }));
+      setBusy(false);
+      return;
+    }
+
+    if (!files.length) {
+      busy = false;
+      box.remove();
+      toast(`${created.case_id} created. Add evidence to begin.`);
+      location.hash = `#/case/${created.case_id}/overview`;
+      return;
+    }
+
+    const outcome = await uploadAndAnalyze(created.case_id, files, progress);
+    busy = false;
+    if (outcome.clean) {
+      box.remove();
+      toast(`${created.case_id} analyzed`);
+      location.hash = `#/case/${created.case_id}/${outcome.analyzed ? "story" : "overview"}`;
+      return;
+    }
+    // Something went wrong part-way. The case exists, so the useful next
+    // step is to open it - not to retry a create that already happened.
+    cancel.disabled = false;
+    cancel.textContent = "Close";
+    submit.hidden = true;
+    progress.appendChild(
+      el("a", {
+        class: "fp-open",
+        href: `#/case/${created.case_id}/${outcome.analyzed ? "story" : "evidence"}`,
+        text: `Open ${created.case_id} →`,
+      })
+    );
+  });
+
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") close();
+  });
+  box.addEventListener("mousedown", (e) => {
+    if (e.target === box) close();
+  });
+
+  box.appendChild(form);
+  document.body.appendChild(box);
+  name.focus();
+}
+
+// A case with nothing analyzed has no story to tell, and six zero counters
+// are not a substitute for saying what to do next.
+function renderGetStarted(c) {
+  const hasEvidence = c.evidence_count > 0;
+  const card = el("section", { class: "card getstarted" });
+  card.appendChild(
+    el("div", { class: "card-head" }, [el("h3", { text: hasEvidence ? "Ready to analyze" : "Add evidence to begin" })])
+  );
+  card.appendChild(
+    el("p", {
+      class: "getstarted-lede",
+      text: hasEvidence
+        ? `${c.evidence_count} evidence item${c.evidence_count === 1 ? " is" : "s are"} waiting. Analysis parses ${c.evidence_count === 1 ? "it" : "them"}, correlates events, runs the detection rules and writes the story.`
+        : "Drop a packet capture or log export. It is hashed, stored read-only and analyzed straight away.",
+    })
+  );
+  const progress = el("div", { class: "wizard-progress", "aria-live": "polite" });
+
+  if (!hasEvidence) {
+    const zone = evidenceDropzone(async (files) => {
+      zone.classList.add("disabled");
+      const outcome = await uploadAndAnalyze(c.case_id, files, progress);
+      if (outcome.clean && outcome.analyzed) {
+        toast(`${c.case_id} analyzed`);
+        location.hash = `#/case/${c.case_id}/story`;
+        return;
+      }
+      zone.classList.remove("disabled");
+      progress.appendChild(
+        el("a", {
+          class: "fp-open",
+          href: "#",
+          text: "Refresh this case",
+          onclick: (e) => {
+            e.preventDefault();
+            route();
+          },
+        })
+      );
+    });
+    card.appendChild(zone);
+  } else {
+    const run = el("button", { type: "button", class: "primary", text: "Analyze now" });
+    run.onclick = async () => {
+      run.disabled = true;
+      progress.replaceChildren(
+        el("div", { class: "loading", text: "Analyzing - parsing, correlating and running detection rules…" })
+      );
+      try {
+        const result = await apiPost(`/cases/${c.case_id}/analyze`, {});
+        const failed = (result.results || []).filter((x) => x.error);
+        if (failed.length) {
+          progress.replaceChildren(
+            el("div", { class: "error-box", text: failed.map((x) => `${x.evidence_id}: ${x.error}`).join("; ") })
+          );
+          run.disabled = false;
+          return;
+        }
+        location.hash = `#/case/${c.case_id}/story`;
+      } catch (e) {
+        progress.replaceChildren(el("div", { class: "error-box", text: "Analysis failed: " + e.message }));
+        run.disabled = false;
+      }
+    };
+    card.appendChild(
+      el("div", { class: "onboard-actions" }, [
+        run,
+        el("a", { href: `#/case/${c.case_id}/evidence`, text: "Review or add evidence first" }),
+      ])
+    );
+  }
+  card.appendChild(progress);
+  return card;
+}
+
+// --- Overview ---
+
+async function renderOverview(app, c) {
+  // --- header -------------------------------------------------------
+  const head = el("div", { class: "case-head" });
+  head.appendChild(
+    el("div", {}, [el("h1", { text: c.name }), el("div", { class: "subtitle", text: c.description || "No description." })])
+  );
+  const actions = el("div", { class: "case-head-actions" });
+  const statusSel = el("select", { title: "Case status" });
+  for (const s of ["open", "investigating", "closed"]) {
+    const opt = el("option", { value: s, text: s });
+    if (s === c.status) opt.selected = true;
+    statusSel.appendChild(opt);
+  }
+  statusSel.onchange = async () => {
+    try {
+      await apiPost(`/cases/${c.case_id}/status`, { status: statusSel.value });
+      toast(`${c.case_id} is now ${statusSel.value}`);
+    } catch (e) {
+      toast("Could not change status: " + e.message, true);
+      statusSel.value = c.status;
+    }
+  };
+  actions.appendChild(statusSel);
+  actions.appendChild(el("button", { class: "danger", text: "Delete case", onclick: () => confirmDelete(c) }));
+  head.appendChild(actions);
+  app.appendChild(head);
+
+  // --- what happened ------------------------------------------------
+  //
+  // Above the counts, deliberately. An investigator opening a case
+  // wants the account first; "81 events" is context for a finding and
+  // was never a finding itself.
+  // Nothing analyzed yet means there is no story, and zero counters and empty
+  // charts say nothing useful. Show the next step instead, and stop there.
+  if (!c.event_count) {
+    app.appendChild(renderGetStarted(c));
+    return;
+  }
+  app.appendChild(narrativeCard(c, { compact: true }));
+
+  // --- KPI row ------------------------------------------------------
+  const corr = c.correlation_by_type || {};
+  const kpis = [
+    ["Events", c.event_count, `across ${c.evidence_count} evidence item${c.evidence_count === 1 ? "" : "s"}`, "k-blue", ICONS.event, "#5b9dff"],
+    ["Entities", c.entity_count, "deterministic IDs across sources", "k-violet", ICONS.entities, "#b07cff"],
+    ["Detections", c.detection_count, "offline rules, no AI", "k-red", ICONS.detections, "#e05a4e"],
+    ["Correlations", c.correlation_count ?? 0, `${corr.related || 0} related · ${corr.possible_relationship || 0} possible`, "k-amber", ICONS.attack, "#e0a030"],
+    ["Files recovered", c.artifact_count ?? 0, "open them under Recovered files", "k-green", ICONS.file, "#4caf50"],
+    ["Findings", c.finding_count, "investigator-owned", "k-blue", ICONS.findings, "#5b9dff"],
+  ];
+  const row = el("div", { class: "kpis" });
+  for (const [label, n, sub, cls, iconPath, stroke] of kpis) {
+    const tile = el("div", { class: "kpi " + cls });
+    const h = el("div", { class: "kpi-head" });
+    const box = el("div", { class: "kpi-icon" });
+    box.appendChild(icon(iconPath, { size: 15, stroke, width: 1.9 }));
+    h.appendChild(box);
+    h.appendChild(el("div", { class: "kpi-l", text: label }));
+    tile.appendChild(h);
+    tile.appendChild(el("div", { class: "kpi-n", text: Number(n || 0).toLocaleString() }));
+    tile.appendChild(el("div", { class: "kpi-s", text: sub }));
+    row.appendChild(tile);
+  }
+  app.appendChild(row);
+
+  // --- analysis runner ---------------------------------------------
+  const runPanel = el("div", { class: "card", style: "margin-bottom:14px" });
+  const runHead = el("div", { class: "card-head" });
+  runHead.appendChild(el("h3", { text: "Analysis" }));
+  const runState = el("span", { class: "run-state " + (c.event_count ? "ok" : "idle"), text: c.event_count ? "complete" : "not run yet" });
+  runHead.appendChild(runState);
+  const runBtn = el("button", { text: c.event_count ? "Re-run analyze" : "Run analyze" });
+  runHead.appendChild(el("span", { class: "right" }, [runBtn]));
+  runPanel.appendChild(runHead);
+  const runOut = el("div");
+  runPanel.appendChild(runOut);
+  app.appendChild(runPanel);
+
+  runBtn.onclick = async () => {
+    runBtn.disabled = true;
+    runState.className = "run-state running";
+    runState.textContent = "in progress…";
+    runOut.innerHTML = "";
+    runOut.appendChild(el("div", { class: "loading", text: "Parsing evidence, correlating, scanning rules…" }));
+    try {
+      const r = await apiPost(`/cases/${c.case_id}/analyze`, {});
+      runOut.innerHTML = "";
+      // Per-evidence failures are reported even when the request itself
+      // succeeded: a partially-failed analyze is not a success.
+      const failed = (r.results || []).filter((x) => x.error);
+      if (failed.length) {
+        runState.className = "run-state bad";
+        runState.textContent = `completed with ${failed.length} error${failed.length === 1 ? "" : "s"}`;
+        for (const f of failed) runOut.appendChild(el("div", { class: "error-box", text: `${f.evidence_id}: ${f.error}` }));
+      } else {
+        runState.className = "run-state ok";
+        runState.textContent = "complete";
+      }
+      runOut.appendChild(
+        el("div", { class: "dim", text: `${r.total_events} events · ${r.total_entities} entities · ${r.detection_count} detection(s)` })
+      );
+      setTimeout(route, 700);
+    } catch (e) {
+      runOut.innerHTML = "";
+      runState.className = "run-state bad";
+      runState.textContent = "error";
+      runOut.appendChild(el("div", { class: "error-box", text: e.message }));
+    } finally {
+      runBtn.disabled = false;
+    }
+  };
+
+  // --- charts row ---------------------------------------------------
+  const charts = el("div", { class: "dash-row dash-chart" });
+  const timelineCard = el("div", { class: "card" });
+  timelineCard.appendChild(
+    el("div", { class: "card-head" }, [el("h3", { text: "Timeline" }), el("span", { class: "dim", text: "event density" })])
+  );
+  const entityCard = el("div", { class: "card" });
+  entityCard.appendChild(
+    el("div", { class: "card-head" }, [el("h3", { text: "Top entities" }), el("span", { class: "dim", text: "by events" })])
+  );
+  const graphCard = el("div", { class: "card" });
+  graphCard.appendChild(el("div", { class: "card-head" }, [el("h3", { text: "Entity graph" })]));
+  charts.appendChild(timelineCard);
+  charts.appendChild(entityCard);
+  charts.appendChild(graphCard);
+  app.appendChild(charts);
+
+  // --- three tables -------------------------------------------------
+  const tables = el("div", { class: "dash-row dash-3" });
+  const detCard = el("div", { class: "card" });
+  detCard.appendChild(el("div", { class: "card-head" }, [el("h3", { text: "Recent detections" })]));
+  const fileCard = el("div", { class: "card" });
+  fileCard.appendChild(
+    el("div", { class: "card-head" }, [
+      el("h3", { text: "Recovered files" }),
+      el("span", { class: "right" }, [el("a", { href: `#/case/${c.case_id}/files`, text: "Open and preview" })]),
+    ])
+  );
+  const triCard = el("div", { class: "card" });
+  triCard.appendChild(
+    el("div", { class: "card-head" }, [el("h3", { text: "Triage matches" }), el("span", { class: "dim", text: "leads, not verdicts" })])
+  );
+  tables.appendChild(detCard);
+  tables.appendChild(fileCard);
+  tables.appendChild(triCard);
+  app.appendChild(tables);
+
+  // --- assistant + custody ------------------------------------------
+  const bottom = el("div", { class: "dash-row dash-2" });
+  const askCard = el("div", { class: "card" });
+  askCard.appendChild(
+    el("div", { class: "card-head" }, [
+      el("h3", { text: "Assistant" }),
+      el("span", { class: "dim", text: "retrieves evidence, cites what it found" }),
+    ])
+  );
+  const auditCard = el("div", { class: "card" });
+  auditCard.appendChild(el("div", { class: "card-head" }, [el("h3", { text: "Chain of custody" })]));
+  bottom.appendChild(askCard);
+  bottom.appendChild(auditCard);
+  app.appendChild(bottom);
+
+  // --- fill everything ----------------------------------------------
+  loadInto(timelineCard, () => apiGet(`/cases/${c.case_id}/timeline`), (entries) => densityChart(entries));
+
+  loadInto(entityCard, () => apiGet(`/cases/${c.case_id}/entities?sort=events&limit=8`), (rows) => {
+    if (!rows.length) return el("div", { class: "empty", text: "No entities extracted." });
+    const t = el("table", { class: "mini" });
+    t.innerHTML = "<thead><tr><th>Value</th><th>Type</th><th>Events</th><th>Links</th></tr></thead>";
+    const tb = el("tbody");
+    for (const e of rows.slice(0, 6)) {
+      tb.appendChild(
+        el("tr", {}, [
+          el("td", {}, [el("a", { href: `#/case/${c.case_id}/entities/${e.entity_id}`, class: "mono", text: e.value })]),
+          el("td", { class: "dim", text: e.entity_type }),
+          el("td", { class: "mono", text: e.event_count }),
+          el("td", { class: "mono dim", text: e.link_count }),
+        ])
+      );
+    }
+    t.appendChild(tb);
+    return t;
+  });
+
+  loadInto(
+    graphCard,
+    async () => {
+      const entities = await apiGet(`/cases/${c.case_id}/entities?sort=events&limit=40`);
+      if (!entities.length) return null;
+      // Centre on something that identifies a host, not whichever entity
+      // simply appears most. By raw event count the winner is invariably
+      // a port - "1 hop from port 80" tells an investigator nothing.
+      const hub =
+        entities.find((e) => e.entity_type === "ip_address") ||
+        entities.find((e) => e.entity_type === "domain") ||
+        entities[0];
+      return { hub, graph: await apiGet(`/cases/${c.case_id}/entities/${hub.entity_id}/graph`) };
+    },
+    (data) => (data ? entityGraph(data.hub, data.graph) : el("div", { class: "empty", text: "No entities to graph." }))
+  );
+
+  loadInto(detCard, () => apiGet(`/cases/${c.case_id}/detections`), (rows) => {
+    if (!rows.length) return el("div", { class: "empty", text: "No rule matched." });
+    const t = el("table", { class: "mini" });
+    const tb = el("tbody");
+    for (const d of rows.slice(0, 6)) {
+      tb.appendChild(
+        el("tr", {}, [
+          el("td", { class: "mono", text: d.rule_id }),
+          el("td", {}, [el("span", { class: "badge badge-" + cssClass(d.severity), text: d.severity })]),
+          el("td", { class: "mono dim", text: d.evidence_id }),
+        ])
+      );
+    }
+    t.appendChild(tb);
+    return t;
+  });
+
+  loadInto(fileCard, () => apiGet(`/cases/${c.case_id}/artifacts`), (rows) => {
+    if (!rows.length) return el("div", { class: "empty", text: "No files recovered." });
+    const t = el("table", { class: "mini" });
+    const tb = el("tbody");
+    for (const f of rows.slice(0, 6)) {
+      tb.appendChild(
+        el("tr", {}, [
+          el("td", {}, [el("a", { class: "mono", href: `#/case/${c.case_id}/files/${encodeURIComponent(f.path)}`, text: f.name })]),
+          el("td", { class: "dim", text: f.missing ? "missing" : (f.type && f.type.label) || f.protocol }),
+          el("td", { class: "mono dim", text: f.missing ? "missing" : fmtBytes(f.size_bytes) }),
+        ])
+      );
+    }
+    t.appendChild(tb);
+    return t;
+  });
+
+  loadInto(
+    triCard,
+    () => apiGet(`/cases/${c.case_id}/triage`),
+    (r) => {
+      if (!r.candidates.length) return el("div", { class: "empty", text: "Nothing matched the patterns." });
+      const t = el("table", { class: "mini" });
+      const tb = el("tbody");
+      for (const x of r.candidates.slice(0, 6)) {
+        tb.appendChild(
+          el("tr", {}, [
+            el("td", {}, [el("span", { class: "badge badge-low mono", text: x.pattern })]),
+            el("td", { class: "mono hit-text", text: x.value.slice(0, 34) }),
+            el("td", { class: "mono dim", text: x.frame_number }),
+          ])
+        );
+      }
+      t.appendChild(tb);
+      return t;
+    },
+    "Needs Wireshark - install tshark to enable triage."
+  );
+
+  loadInto(auditCard, () => apiGet(`/cases/${c.case_id}/audit`), (data) => {
+    const entries = data.entries || data;
+    const wrap = el("div");
+    if (data.intact !== undefined) {
+      wrap.appendChild(
+        el("div", { class: "dim", style: `color:${data.intact ? "var(--ok)" : "var(--bad)"};margin-bottom:8px` }, [
+          el("span", { text: data.intact ? "hash chain intact" : "CHAIN BROKEN" }),
+        ])
+      );
+    }
+    const t = el("table", { class: "mini" });
+    const tb = el("tbody");
+    for (const e of entries.slice(-6).reverse()) {
+      tb.appendChild(
+        el("tr", {}, [
+          el("td", { class: "mono dim", text: e.action }),
+          el("td", { text: e.actor }),
+          el("td", { class: "mono dim", text: (e.timestamp || "").slice(11, 19) }),
+        ])
+      );
+    }
+    t.appendChild(tb);
+    wrap.appendChild(t);
+    return wrap;
+  });
+
+  askCard.appendChild(miniAsk(c));
+}
+
+// A one-shot ask box on the dashboard. The full conversation lives on the
+// Ask surface; this is for the question you have while looking at totals.
+function miniAsk(c) {
+  const wrap = el("div");
+  const out = el("div");
+  wrap.appendChild(out);
+
+  const bar = el("div", { class: "filter-bar", style: "margin-top:10px;margin-bottom:0" });
+  const q = el("input", { placeholder: "Ask about this case…", style: "flex-grow:1;min-width:200px" });
+  const send = el("button", { text: "Ask" });
+  bar.appendChild(q);
+  bar.appendChild(send);
+  wrap.appendChild(bar);
+
+  async function ask() {
+    const question = q.value.trim();
+    if (!question) return;
+    out.innerHTML = "";
+    out.appendChild(el("div", { class: "bubble-me", text: question }));
+    const pending = el("div", { class: "loading", text: "Retrieving evidence…" });
+    out.appendChild(pending);
+    send.disabled = true;
+    try {
+      const r = await apiPost(`/cases/${c.case_id}/chat`, { question });
+      pending.remove();
+      out.appendChild(el("div", { class: "answer", text: r.answer }));
+      if (r.citations && r.citations.length) {
+        const cites = el("div", { class: "cites" });
+        for (const cit of r.citations) cites.appendChild(el("span", { class: "cite", text: `${cit.kind} ${cit.reference}` }));
+        out.appendChild(cites);
+      }
+      out.appendChild(
+        el("div", { class: "dim", style: "margin-top:8px", text: "Claims citing anything the tools did not return are refused, not shown." })
+      );
+    } catch (e) {
+      pending.remove();
+      const refused = /refused/i.test(e.message);
+      out.appendChild(el("div", { class: refused ? "refused" : "error-box", text: (refused ? "Answer refused. " : "Error: ") + e.message }));
+    } finally {
+      send.disabled = false;
+    }
+  }
+  send.onclick = ask;
+  q.onkeydown = (ev) => {
+    if (ev.key === "Enter") ask();
+  };
+  return wrap;
+}
+
+// --- charts ----------------------------------------------------------
+//
+// Drawn as inline SVG rather than pulled from a chart library: the UI
+// ships with no build step and no CDN, and a stacked bar chart is a
+// hundred lines of rectangles.
+
+function densityChart(entries) {
+  const stamped = entries.filter((e) => e.timestamp);
+  if (!stamped.length) return el("div", { class: "empty", text: "No timestamped events." });
+
+  const times = stamped.map((e) => new Date(e.timestamp).getTime());
+  const first = Math.min(...times);
+  const last = Math.max(...times);
+  const BUCKETS = 36;
+  const span = Math.max(last - first, 1);
+  const width = Math.max(span / BUCKETS, 1);
+
+  const buckets = Array.from({ length: BUCKETS }, () => ({ all: 0, detection: 0 }));
+  for (const e of stamped) {
+    const idx = Math.min(BUCKETS - 1, Math.floor((new Date(e.timestamp).getTime() - first) / width));
+    buckets[idx].all += 1;
+    if (e.event_type === "anomaly" || (e.severity && e.severity !== "info")) buckets[idx].detection += 1;
+  }
+  const peak = Math.max(...buckets.map((b) => b.all), 1);
+
+  const W = 560;
+  const H = 168;
+  const pad = 26;
+  const barW = (W - pad) / BUCKETS - 3;
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("style", "width:100%;height:168px;display:block");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Event volume over time (timeline density)");
+
+  let markup = "";
+  for (let g = 0; g <= 3; g++) {
+    const y = 10 + ((H - 40) / 3) * g;
+    markup += `<line x1="${pad}" y1="${y}" x2="${W}" y2="${y}" stroke="#2a2f3f" stroke-width="1"/>`;
+    const value = Math.round((peak / 3) * (3 - g));
+    markup += `<text x="${pad - 5}" y="${y + 3}" fill="#868ca0" font-size="9" text-anchor="end">${value}</text>`;
+  }
+  buckets.forEach((b, i) => {
+    const x = pad + i * ((W - pad) / BUCKETS);
+    const full = ((H - 40) * b.all) / peak;
+    const flagged = ((H - 40) * b.detection) / peak;
+    markup += `<rect x="${x}" y="${H - 30 - full}" width="${barW}" height="${Math.max(full, 0.5)}" fill="#5b9dff" rx="1.5"/>`;
+    if (flagged > 0) {
+      markup += `<rect x="${x}" y="${H - 30 - flagged}" width="${barW}" height="${flagged}" fill="#e0a030" rx="1.5"/>`;
+    }
+  });
+  const fmt = (ms) => new Date(ms).toISOString().slice(11, 16);
+  markup += `<text x="${pad}" y="${H - 8}" fill="#868ca0" font-size="9">${fmt(first)}</text>`;
+  markup += `<text x="${W}" y="${H - 8}" fill="#868ca0" font-size="9" text-anchor="end">${fmt(last)}</text>`;
+  svg.innerHTML = markup;
+
+  const wrap = el("div");
+  wrap.appendChild(
+    el("div", { class: "legend" }, [
+      el("span", {}, [el("span", { class: "swatch", style: "background:#5b9dff" }), el("span", { text: "all events" })]),
+      el("span", {}, [el("span", { class: "swatch", style: "background:#e0a030" }), el("span", { text: "flagged" })]),
+    ])
+  );
+  wrap.appendChild(svg);
+  wrap.appendChild(el("div", { class: "dim", style: "margin-top:6px", text: `${stamped.length.toLocaleString()} timestamped events` }));
+  return wrap;
+}
+
+function entityGraph(hub, data) {
+  const related = (data.related || []).slice(0, 14);
+  if (!related.length) return el("div", { class: "empty", text: "No related entities." });
+
+  const W = 340;
+  const H = 200;
+  const cx = W / 2;
+  const cy = H / 2 - 6;
+  const colour = { ip_address: "#5b9dff", domain: "#b07cff", url: "#e0a030", port: "#4caf50" };
+
+  let markup = "";
+  const points = related.map((r, i) => {
+    const angle = (i / related.length) * Math.PI * 2 - Math.PI / 2;
+    return { x: cx + Math.cos(angle) * 80, y: cy + Math.sin(angle) * 66, r };
+  });
+  for (const p of points) markup += `<line x1="${cx}" y1="${cy}" x2="${p.x}" y2="${p.y}" stroke="#2a3350" stroke-width="1"/>`;
+  for (const p of points) {
+    markup += `<circle cx="${p.x}" cy="${p.y}" r="5" fill="${colour[p.r.entity_type] || "#9aa0b4"}"><title>${escapeHtml(
+      p.r.entity_type + " " + p.r.value
+    )}</title></circle>`;
+  }
+  markup += `<circle cx="${cx}" cy="${cy}" r="13" fill="#5b9dff" opacity="0.25"/>`;
+  markup += `<circle cx="${cx}" cy="${cy}" r="8.5" fill="#5b9dff"/>`;
+  markup += `<text x="${cx}" y="${cy + 26}" fill="#9aa0b4" font-size="10" text-anchor="middle" font-family="SF Mono, Consolas, monospace">${escapeHtml(
+    hub.value
+  )}</text>`;
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("style", "width:100%;height:200px;display:block");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `Entity relationship graph for ${hub.value}`);
+  svg.innerHTML = markup;
+
+  const wrap = el("div");
+  wrap.appendChild(svg);
+  wrap.appendChild(
+    el("div", { class: "dim", text: `1 hop from ${hub.value} · ${related.length} of ${(data.related || []).length} shown` })
+  );
+  return wrap;
+}
+
+// Fill a panel from an endpoint, showing loading / empty / a degraded
+// note rather than an error box for the surfaces that need Wireshark: a
+// missing optional dependency is a setup step, not a fault.
+async function loadInto(panel, fetcher, build, degradedNote) {
+  const slot = el("div", { class: "loading", text: "Loading…" });
+  panel.appendChild(slot);
+  try {
+    const data = await fetcher();
+    slot.replaceWith(build(data));
+  } catch (e) {
+    const needsTshark = /tshark|wireshark/i.test(e.message);
+    slot.replaceWith(
+      el("div", {
+        class: needsTshark ? "dim" : "error-box",
+        text: needsTshark && degradedNote ? degradedNote : (needsTshark ? e.message : "Error: " + e.message),
+      })
+    );
+  }
+}
+
+// --- The narrative: the case as an account of what happened ------------
+//
+// core/narrative.py does the reasoning; this only draws it. Nothing here
+// derives a fact, re-orders a phase or picks a severity of its own - if
+// the panel disagrees with `trusttrace story` on the same case, the bug
+// is here, and that is deliberate: one place decides what happened.
+
+// The canonical stages, drawn whether or not they were evidenced. A stage
+// with nothing in it is information too - but it means "no bundled rule
+// matched", never "this did not happen", which is why absent chips are
+// labelled rather than simply left out.
+const STAGES = [
+  ["reconnaissance", "Recon"],
+  ["initial-access", "Access"],
+  ["delivery", "Delivery"],
+  ["execution", "Execution"],
+  ["persistence", "Persistence"],
+  ["privilege-escalation", "Priv-esc"],
+  ["defense-evasion", "Evasion"],
+  ["credential-access", "Credentials"],
+  ["lateral-movement", "Lateral"],
+  ["collection", "Collection"],
+  ["exfiltration", "Exfiltration"],
+  ["command-and-control", "C2"],
+  ["impact", "Impact"],
+];
+
+function beatTime(iso) {
+  if (!iso) return "unknown time";
+  const t = String(iso).replace("T", " ");
+  return t.slice(11, 19) || t.slice(0, 19);
+}
+
+function stageStrip(present) {
+  const strip = el("div", { class: "nar-stages" });
+  STAGES.forEach(([key, label], i) => {
+    const on = present.has(key);
+    strip.appendChild(
+      el("span", {
+        class: "nar-stage" + (on ? " on" : ""),
+        text: label,
+        title: on ? "" : "No bundled rule matched this stage - not proof it did not happen.",
+      })
+    );
+    if (i < STAGES.length - 1) strip.appendChild(el("span", { class: "nar-arrow", text: "→" }));
+  });
+  return strip;
+}
+
+function beatRow(c, beat, opts) {
+  const row = el("div", { class: "beat sev-" + cssClass(beat.severity) });
+  const head = el("div", { class: "beat-head" });
+  head.appendChild(el("span", { class: "beat-dot" }));
+  head.appendChild(
+    el("span", { class: "beat-time mono", text: beatTime(beat.first_seen), title: beat.first_seen || "" })
+  );
+  head.appendChild(el("span", { class: "beat-title", text: beat.title }));
+  if (beat.occurrences > 1) head.appendChild(el("span", { class: "beat-x", text: "×" + beat.occurrences }));
+  head.appendChild(el("span", { class: "badge badge-" + cssClass(beat.severity), text: beat.severity }));
+  row.appendChild(head);
+  row.appendChild(el("div", { class: "beat-desc", text: beat.description }));
+
+  if (!(opts && opts.full)) return row;
+
+  // Citations. The whole claim of this panel is that every sentence walks
+  // back to a packet, so the ids are shown rather than summarised, and
+  // each one opens where those packets actually are.
+  const cite = el("div", { class: "beat-cite" });
+  cite.appendChild(el("span", { class: "dim", text: "evidence " }));
+  for (const id of (beat.event_ids || []).slice(0, 6)) {
+    cite.appendChild(
+      el("a", {
+        class: "cite-chip mono",
+        href: "#",
+        text: id,
+        title: "Show the display filter that isolates this event",
+        onclick: (ev) => {
+          ev.preventDefault();
+          showPivot(c, id);
+        },
+      })
+    );
+  }
+  const extra = (beat.event_ids || []).length - 6;
+  if (extra > 0) cite.appendChild(el("span", { class: "dim", text: "+" + extra + " more" }));
+  if (beat.hosts && beat.hosts.length) {
+    // opts is guaranteed truthy here - the early return above bails when it isn't.
+    const hostMap = opts.hostEntities || {};
+    const hostWrap = el("span", { class: "beat-hosts dim" });
+    hostWrap.appendChild(el("span", { text: "· " }));
+    beat.hosts.forEach((host, i) => {
+      if (i > 0) hostWrap.appendChild(el("span", { text: ", " }));
+      hostWrap.appendChild(hostEl(c, host, hostMap));
+    });
+    cite.appendChild(hostWrap);
+  }
+  row.appendChild(cite);
+  return row;
+}
+
+// A host in the story: a link to its entity graph when it has one, plain
+// dim text otherwise (an external IP that never became an entity). The map
+// comes from the narrative, so we never link to a page that does not exist.
+function hostEl(c, host, hostMap) {
+  const entityId = hostMap && hostMap[host];
+  if (!entityId) return el("span", { class: "dim mono", text: host });
+  return el("a", {
+    class: "host-link mono",
+    href: `#/case/${c.case_id}/host/${entityId}`,
+    text: host,
+    title: `Everything ${host} did`,
+  });
+}
+
+// The pivot to packets. Read-only: it resolves the display filter and the
+// command, and launches nothing on the server's behalf.
+async function showPivot(c, eventId) {
+  const box = el("div", { class: "modal" });
+  const card = el("div", { class: "modal-card" });
+  card.appendChild(el("h3", { text: eventId }));
+  const body = el("div");
+  card.appendChild(body);
+  const actions = el("div", { class: "modal-actions" });
+  actions.appendChild(el("button", { class: "secondary", text: "Close", onclick: () => box.remove() }));
+  card.appendChild(actions);
+  box.appendChild(card);
+  document.body.appendChild(box);
+
+  body.appendChild(el("div", { class: "loading", text: "Resolving…" }));
+  try {
+    const p = await apiGet(`/cases/${c.case_id}/events/${eventId}/wireshark`);
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "dim", text: "Display filter" }));
+    body.appendChild(el("pre", { class: "pivot", text: p.display_filter }));
+    body.appendChild(el("div", { class: "dim", text: "Open the packets" }));
+    // gui_command() returns one shell-quoted string, ready to paste.
+    body.appendChild(el("pre", { class: "pivot", text: p.command }));
+    if (!p.gui_available) {
+      body.appendChild(
+        el("div", {
+          class: "dim",
+          text: "The Wireshark GUI was not found on this machine - run the command where it is installed.",
+        })
+      );
+    }
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "error-box", text: e.message }));
+  }
+}
+
+function narrativeBody(c, n, opts) {
+  const full = !!(opts && opts.full);
+  const wrap = el("div", { class: "nar-body" });
+
+  const assess = el("div", { class: "nar-assess sev-" + cssClass(n.severity) });
+  assess.appendChild(el("span", { class: "badge badge-" + cssClass(n.severity), text: n.severity }));
+  assess.appendChild(el("div", { class: "nar-statement", text: n.assessment }));
+  wrap.appendChild(assess);
+
+  const hostEntities = n.host_entities || {};
+  const meta = el("div", { class: "nar-meta" });
+  const window_ = n.window || [null, null];
+  const leading = [n.headline, window_[0] ? beatTime(window_[0]) + " → " + beatTime(window_[1]) : null].filter(Boolean);
+  meta.appendChild(el("span", { text: leading.join("  ·  ") }));
+  if (n.subjects && n.subjects.length) {
+    meta.appendChild(el("span", { text: "  ·  " }));
+    n.subjects.forEach((host, i) => {
+      if (i > 0) meta.appendChild(el("span", { text: ", " }));
+      meta.appendChild(hostEl(c, host, hostEntities));
+    });
+  }
+  wrap.appendChild(meta);
+
+  const phases = n.phases || [];
+  if (!phases.length) return wrap;
+
+  wrap.appendChild(stageStrip(new Set(phases.map((p) => p.phase))));
+
+  if (full) {
+    for (const phase of phases) {
+      const sec = el("div", { class: "nar-phase" });
+      sec.appendChild(el("div", { class: "nar-phase-title", text: phase.title }));
+      for (const beat of phase.beats) sec.appendChild(beatRow(c, beat, { full: true, hostEntities }));
+      wrap.appendChild(sec);
+    }
+    return wrap;
+  }
+
+  // Compact: the first few beats in the order they happened, then a way
+  // through to the rest. Truncating silently would misrepresent the case.
+  const flat = phases.reduce((acc, p) => acc.concat(p.beats), []);
+  const shown = flat.slice(0, 4);
+  const list = el("div", { class: "nar-beats" });
+  for (const beat of shown) list.appendChild(beatRow(c, beat, { full: false, hostEntities }));
+  wrap.appendChild(list);
+  const hidden = flat.length - shown.length;
+  if (hidden > 0) {
+    wrap.appendChild(
+      el("a", {
+        class: "nar-more",
+        href: `#/case/${c.case_id}/story`,
+        text: `${hidden} more finding${hidden === 1 ? "" : "s"} in the full story →`,
+      })
+    );
+  }
+  return wrap;
+}
+
+function narrativeCard(c, opts) {
+  const card = el("div", { class: "card narrative" });
+  const head = el("div", { class: "card-head" });
+  head.appendChild(el("h3", { text: "What happened" }));
+  head.appendChild(el("span", { class: "dim", text: "assembled from detections - no model, no network" }));
+  head.appendChild(
+    el("span", { class: "right" }, [el("a", { href: `#/case/${c.case_id}/story`, text: "Full story →" })])
+  );
+  card.appendChild(head);
+
+  loadInto(card, () => apiGet(`/cases/${c.case_id}/narrative`), (n) => {
+    card.classList.add("sev-" + cssClass(n.severity));
+    if (!c.event_count) {
+      return el("div", {
+        class: "empty",
+        text: "Nothing has been analysed yet. Run analyze below, and the account of what happened appears here.",
+      });
+    }
+    return narrativeBody(c, n, opts);
+  });
+  return card;
+}
+
+async function renderStory(app, c) {
+  app.appendChild(el("h1", { text: "What happened" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "The case as an account rather than a count, assembled from the detections and the events they cite. " +
+        "Deterministic: the same evidence produces the same story, and every line names the events it rests on.",
+    })
+  );
+  const panel = el("div", { class: "card narrative" });
+  app.appendChild(panel);
+  loadInto(panel, () => apiGet(`/cases/${c.case_id}/narrative`), (n) => {
+    panel.classList.add("sev-" + cssClass(n.severity));
+    return narrativeBody(c, n, { full: true });
+  });
+}
+
+// Deleting a case destroys the evidence AND the chain of custody, so the
+// confirmation makes the caller type the ID rather than click through a
+// yes/no - the same bar the CLI sets.
+function confirmDelete(c) {
+  const box = el("div", { class: "modal" });
+  const card = el("div", { class: "modal-card" });
+  card.appendChild(el("h3", { text: `Delete ${c.case_id}?` }));
+  card.appendChild(
+    el("div", { text: `"${c.name}" — ${c.evidence_count} evidence item(s), ${c.finding_count} finding(s).` })
+  );
+  card.appendChild(
+    el("div", {
+      class: "warn-note",
+      text:
+        "This is irreversible. It removes the evidence copies, the event store, carved artifacts, findings, reports and the chain of custody. There is no trash to recover it from.",
+    })
+  );
+  const input = el("input", { placeholder: `Type ${c.case_id} to confirm`, style: "width:100%" });
+  card.appendChild(input);
+  const actions = el("div", { class: "modal-actions" });
+  const cancel = el("button", { class: "secondary", text: "Cancel" });
+  const del = el("button", { class: "danger", text: "Delete permanently" });
+  del.disabled = true;
+  input.oninput = () => {
+    del.disabled = input.value.trim() !== c.case_id;
+  };
+  cancel.onclick = () => box.remove();
+  del.onclick = async () => {
+    del.disabled = true;
+    del.textContent = "Deleting…";
+    try {
+      const s = await apiDelete(`/cases/${c.case_id}`, { confirm: c.case_id });
+      box.remove();
+      toast(`Deleted ${s.case_id} — ${s.evidence_count} evidence item(s), ${(s.size_bytes / 1e6).toFixed(1)} MB.`);
+      location.hash = "#/";
+    } catch (e) {
+      del.disabled = false;
+      del.textContent = "Delete permanently";
+      card.appendChild(el("div", { class: "error-box", text: e.message }));
+    }
+  };
+  actions.appendChild(cancel);
+  actions.appendChild(del);
+  card.appendChild(actions);
+  box.appendChild(card);
+  document.body.appendChild(box);
+  input.focus();
+}
+
+// --- Evidence ---
+
+async function renderEvidence(app, c) {
+  app.appendChild(el("h1", { text: "Evidence" }));
+
+  const uploadBar = el("div", { class: "filter-bar" });
+  const fileInput = el("input", { type: "file" });
+  const uploadBtn = el("button", { text: "Upload Evidence" });
+  const analyzeBtn = el("button", { class: "secondary", text: "Run Analyze" });
+  uploadBar.appendChild(fileInput);
+  uploadBar.appendChild(uploadBtn);
+  uploadBar.appendChild(analyzeBtn);
+  app.appendChild(uploadBar);
+
+  const statusBox = el("div");
+  app.appendChild(statusBox);
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+
+  async function loadList() {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    try {
+      const items = await apiGet(`/cases/${c.case_id}/evidence`);
+      panel.innerHTML = "";
+      if (!items.length) {
+        panel.appendChild(el("div", { class: "empty", text: "No evidence recorded." }));
+        return;
+      }
+      const table = el("table");
+      table.innerHTML =
+        "<tr><th>ID</th><th>Filename</th><th>Type</th><th>Size</th><th>SHA-256</th><th>Imported</th></tr>" +
+        items
+          .map(
+            (e) => `<tr>
+          <td class="mono">${escapeHtml(e.evidence_id)}</td>
+          <td>${escapeHtml(e.filename)}</td>
+          <td>${escapeHtml(e.evidence_type)}</td>
+          <td>${e.size_bytes}</td>
+          <td class="mono" title="${escapeHtml(e.sha256)}">${escapeHtml(e.sha256.slice(0, 16))}…</td>
+          <td>${escapeHtml((e.imported_at || "").split("T")[0])}</td>
+        </tr>`
+          )
+          .join("");
+      panel.appendChild(table);
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  uploadBtn.addEventListener("click", async () => {
+    const file = fileInput.files[0];
+    if (!file) {
+      toast("Choose a file first.", true);
+      return;
+    }
+    uploadBtn.disabled = true;
+    statusBox.innerHTML = "";
+    statusBox.appendChild(el("div", { class: "loading", text: `Uploading ${file.name}...` }));
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const evidence = await apiUpload(`/cases/${c.case_id}/evidence`, formData);
+      statusBox.innerHTML = "";
+      statusBox.appendChild(
+        el("div", { text: `Ingested ${evidence.evidence_id}: ${evidence.filename} (${evidence.evidence_type})` })
+      );
+      fileInput.value = "";
+      await loadList();
+    } catch (e) {
+      statusBox.innerHTML = "";
+      statusBox.appendChild(el("div", { class: "error-box", text: "Upload failed: " + e.message }));
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  });
+
+  analyzeBtn.addEventListener("click", async () => {
+    analyzeBtn.disabled = true;
+    statusBox.innerHTML = "";
+    statusBox.appendChild(el("div", { class: "loading", text: "Analyzing (parsing evidence + correlating)…" }));
+    try {
+      const result = await apiPost(`/cases/${c.case_id}/analyze`);
+      statusBox.innerHTML = "";
+      const lines = result.results.map((r) =>
+        r.error
+          ? `${r.evidence_id}: skipped - ${r.error}`
+          : `${r.evidence_id} (${r.evidence_type}): ${r.event_count} events, ${r.entity_count} entities`
+      );
+      lines.push(`Total: ${result.total_events} events, ${result.total_entities} distinct entities`);
+      statusBox.appendChild(el("div", { text: lines.join(" · ") }));
+    } catch (e) {
+      statusBox.innerHTML = "";
+      statusBox.appendChild(el("div", { class: "error-box", text: "Analyze failed: " + e.message }));
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  });
+
+  await loadList();
+}
+
+// --- Timeline ---
+
+// "2023-11-14T22:13:19.050000+00:00" -> "2023-11-14 22:13:19 UTC". Evidence
+// times stay in UTC (a case mixes machines in different zones), but say so.
+function timelineTime(iso) {
+  if (!iso) return "unknown time";
+  const m = String(iso).match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/);
+  return m ? `${m[1]} ${m[2]} UTC` : String(iso);
+}
+
+async function renderTimeline(app, c) {
+  await glossary();
+  app.appendChild(el("h1", { text: "Timeline" }));
+  const fields = ["user", "ip", "hostname", "process", "file", "type", "evidence"];
+  const filterBar = el("div", { class: "filter-bar" });
+  const inputs = {};
+  for (const f of fields) {
+    const input = el("input", { placeholder: f });
+    inputs[f] = input;
+    filterBar.appendChild(input);
+  }
+  const applyBtn = el("button", { text: "Filter" });
+  const clearBtn = el("button", { class: "secondary", text: "Clear" });
+  filterBar.appendChild(applyBtn);
+  filterBar.appendChild(clearBtn);
+  app.appendChild(filterBar);
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+
+  async function load() {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    const params = new URLSearchParams();
+    for (const f of fields) {
+      const v = inputs[f].value.trim();
+      if (v) params.set(f, v);
+    }
+    try {
+      const entries = await apiGet(`/cases/${c.case_id}/timeline?` + params.toString());
+      panel.innerHTML = "";
+      if (!entries.length) {
+        panel.appendChild(el("div", { class: "empty", text: "No timeline entries match." }));
+        return;
+      }
+      const table = el("table");
+      table.innerHTML =
+        "<tr><th>Timestamp</th><th>Type</th><th>Source</th><th>Evidence</th><th>Summary</th></tr>" +
+        entries
+          .map(
+            (e) => `<tr>
+          <td class="mono" title="${escapeHtml(e.timestamp || "")}">${escapeHtml(timelineTime(e.timestamp))}</td>
+          <td title="${escapeHtml(e.event_type)}">${escapeHtml(eventLabel(e.event_type))}</td>
+          <td>${escapeHtml(e.source)}</td>
+          <td class="mono">${escapeHtml(e.evidence_id)}</td>
+          <td>${escapeHtml(summarizeEntry(e))}</td>
+        </tr>`
+          )
+          .join("");
+      panel.appendChild(table);
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  applyBtn.addEventListener("click", load);
+  clearBtn.addEventListener("click", () => {
+    for (const f of fields) inputs[f].value = "";
+    load();
+  });
+  await load();
+}
+
+function summarizeEntry(e) {
+  if (e.message) return e.message;
+  const parts = [];
+  for (const [label, key] of [
+    ["user", "user"],
+    ["hostname", "hostname"],
+    ["src_ip", "src_ip"],
+    ["dst_ip", "dst_ip"],
+    ["process", "process_name"],
+    ["file", "file_name"],
+  ]) {
+    if (e[key]) parts.push(`${label}=${e[key]}`);
+  }
+  return parts.join(" ") || "(no details)";
+}
+
+// --- Entities + graph + investigate ---
+
+async function renderEntities(app, c, focusEntityId) {
+  app.appendChild(el("h1", { text: "Entities" }));
+  const filterBar = el("div", { class: "filter-bar" });
+  const searchInput = el("input", { placeholder: "Search value…" });
+  const typeSelect = el("select", {});
+  typeSelect.innerHTML =
+    '<option value="">All types</option>' +
+    ["user", "hostname", "device", "ip_address", "domain", "url", "file", "hash", "process", "port", "network_connection"]
+      .map((t) => `<option value="${t}">${t}</option>`)
+      .join("");
+  const searchBtn = el("button", { text: "Search" });
+  filterBar.appendChild(searchInput);
+  filterBar.appendChild(typeSelect);
+  filterBar.appendChild(searchBtn);
+  app.appendChild(filterBar);
+
+  const layout = el("div", { class: "two-col" });
+  const leftCol = el("div", {});
+  const rightCol = el("div", { class: "investigate-panel" });
+  layout.appendChild(leftCol);
+  layout.appendChild(rightCol);
+  app.appendChild(layout);
+
+  const listPanel = el("div", { class: "panel" });
+  leftCol.appendChild(listPanel);
+
+  const canvasPanel = el("div", { class: "panel" });
+  const canvasTitle = el("h3", { text: "Entity Graph" });
+  canvasPanel.appendChild(canvasTitle);
+  const canvas = el("canvas", { id: "graph-canvas", width: "760", height: "420" });
+  canvasPanel.appendChild(canvas);
+  leftCol.appendChild(canvasPanel);
+
+  rightCol.appendChild(el("div", { class: "panel" }, [el("div", { class: "empty", text: "Select an entity to investigate." })]));
+
+  async function loadList() {
+    listPanel.innerHTML = "";
+    listPanel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    const params = new URLSearchParams();
+    const q = searchInput.value.trim();
+    const t = typeSelect.value;
+    if (q) params.set("q", q);
+    if (t) params.set("type", t);
+    try {
+      const items = await apiGet(`/cases/${c.case_id}/entities?` + params.toString());
+      listPanel.innerHTML = "";
+      if (!items.length) {
+        listPanel.appendChild(el("div", { class: "empty", text: "No entities match." }));
+        return;
+      }
+      const table = el("table");
+      table.innerHTML = "<tr><th>Type</th><th>Value</th></tr>";
+      listPanel.appendChild(table);
+      for (const item of items.slice(0, 200)) {
+        // The whole row answers a mouse; the value is a real button so the
+        // row can be reached and opened from the keyboard too (its click
+        // bubbles to the row - one handler, not two).
+        const tr = el("tr", { class: "clickable", onclick: () => selectEntity(item) });
+        tr.appendChild(el("td", { text: item.entity_type }));
+        tr.appendChild(
+          el("td", {}, [
+            el("button", { type: "button", class: "cell-button mono", text: item.value, "aria-label": `Open ${item.entity_type} ${item.value}` }),
+          ])
+        );
+        table.appendChild(tr);
+      }
+    } catch (e) {
+      listPanel.innerHTML = "";
+      listPanel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  async function selectEntity(item) {
+    history.replaceState(null, "", `#/case/${c.case_id}/entities/${item.entity_id}`);
+    canvasTitle.textContent = `Entity Graph — ${item.entity_type}: ${item.value}`;
+    try {
+      const graphData = await apiGet(`/cases/${c.case_id}/entities/${item.entity_id}/graph`);
+      drawGraph(canvas, graphData.entity, graphData.related);
+    } catch (e) {
+      toast("Graph error: " + e.message, true);
+    }
+
+    rightCol.innerHTML = "";
+    const panel = el("div", { class: "panel" });
+    panel.appendChild(el("div", { class: "loading", text: "Investigating…" }));
+    rightCol.appendChild(panel);
+    try {
+      const result = await apiGet(
+        `/cases/${c.case_id}/investigate?type=${encodeURIComponent(item.entity_type)}&value=${encodeURIComponent(item.value)}`
+      );
+      await renderInvestigatePanel(panel, c, result);
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  searchBtn.addEventListener("click", loadList);
+  searchInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") loadList();
+  });
+  await loadList();
+
+  if (focusEntityId) {
+    try {
+      const graphData = await apiGet(`/cases/${c.case_id}/entities/${focusEntityId}/graph`);
+      await selectEntity(graphData.entity);
+    } catch (e) {
+      /* deep-linked entity may not exist; ignore */
+    }
+  }
+}
+
+async function renderInvestigatePanel(panel, c, result) {
+  panel.innerHTML = "";
+  panel.appendChild(el("h3", { text: "Investigation" }));
+  panel.innerHTML += `
+    <div class="mono" style="margin-bottom:8px;">${escapeHtml(result.entity.entity_type)}: ${escapeHtml(result.entity.value)}</div>
+    <div style="margin-bottom:10px; color: var(--text-dim); font-size:12px;">
+      Evidence: ${result.evidence_ids.map(escapeHtml).join(", ") || "none"} &middot; Events: ${result.timeline.length}
+    </div>`;
+
+  // For a host, the dossier is the fuller view - offer the jump.
+  if (result.entity.entity_type === "ip_address") {
+    panel.appendChild(
+      el("a", {
+        class: "button-link secondary",
+        href: `#/case/${c.case_id}/host/${result.entity.entity_id}`,
+        text: "See everything this host did →",
+      })
+    );
+  }
+
+  panel.appendChild(el("h3", { text: "Potential Investigation Leads" }));
+  const leadsBox = el("div");
+  if (result.leads.length) {
+    for (const lead of result.leads) leadsBox.appendChild(el("div", { class: "lead", text: lead }));
+  } else {
+    leadsBox.appendChild(el("div", { class: "empty", text: "No leads." }));
+  }
+  panel.appendChild(leadsBox);
+
+  // Threat intel
+  panel.appendChild(el("h3", { text: "Threat Intelligence" }));
+  const tiBox = el("div");
+  tiBox.appendChild(el("div", { class: "empty", text: "Not checked in this session." }));
+  panel.appendChild(tiBox);
+  const tiKeyInput = el("input", {
+    placeholder: "VT API key (optional if VT_API_KEY set server-side)",
+    style: "width:100%; margin-bottom:6px;",
+  });
+  const tiBtn = el("button", { class: "secondary", text: "Check VirusTotal" });
+  panel.appendChild(tiKeyInput);
+  panel.appendChild(tiBtn);
+  tiBtn.addEventListener("click", async () => {
+    tiBtn.disabled = true;
+    tiBox.innerHTML = "";
+    tiBox.appendChild(el("div", { class: "loading", text: "Checking…" }));
+    try {
+      const body = {
+        entity_id: result.entity.entity_id,
+        entity_type: result.entity.entity_type,
+        value: result.entity.value,
+      };
+      if (tiKeyInput.value.trim()) body.api_key = tiKeyInput.value.trim();
+      const r = await apiPost(`/cases/${c.case_id}/threat-intel`, body);
+      tiBox.innerHTML = "";
+      if (r.error) {
+        // A "no API key" / HTTP / network error means no real check
+        // happened - r.malicious is just an unset default in that case,
+        // not a genuine negative result, so never show a verdict line
+        // alongside an error.
+        const message = r.error === "no API key" ? "Not checked: no API key provided." : "Error: " + r.error;
+        tiBox.appendChild(el("div", { class: "error-box", text: message }));
+      } else {
+        const verdict = r.malicious ? "FLAGGED MALICIOUS" : "not flagged malicious";
+        const engines = `${r.malicious_count ?? "?"}/${r.total_engines ?? "?"} engines`;
+        tiBox.appendChild(el("div", { text: `${verdict} (${engines})${r.cached ? " — cached" : ""}` }));
+      }
+    } catch (e) {
+      tiBox.innerHTML = "";
+      tiBox.appendChild(el("div", { class: "error-box", text: e.message }));
+    } finally {
+      tiBtn.disabled = false;
+    }
+  });
+
+  // AI hypothesis
+  panel.appendChild(el("h3", { text: "AI Investigation Hypothesis" }));
+  const aiBox = el("div");
+  aiBox.appendChild(el("div", { class: "empty", text: "Not requested - this calls an external AI service (optional)." }));
+  panel.appendChild(aiBox);
+
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"], default_models: {} };
+  try {
+    providerInfo = await apiGet("/ai-providers");
+  } catch (e) {
+    /* falls back to the hardcoded list above if the endpoint can't be reached */
+  }
+  const PROVIDER_KEY_HINTS = {
+    anthropic: "Anthropic API key (optional if ANTHROPIC_API_KEY set server-side)",
+    openai: "OpenAI API key (optional if OPENAI_API_KEY set server-side)",
+    gemini: "Gemini API key (optional if GEMINI_API_KEY set server-side)",
+    ollama: "Not needed - Ollama runs locally",
+  };
+
+  const aiRow = el("div", { class: "filter-bar" });
+  const aiProviderSelect = selectEl(providerInfo.providers, "anthropic");
+  const aiKeyInput = el("input", { placeholder: PROVIDER_KEY_HINTS.anthropic, style: "min-width:260px;" });
+  aiRow.appendChild(aiProviderSelect);
+  aiRow.appendChild(aiKeyInput);
+  panel.appendChild(aiRow);
+  const aiModelInput = el("input", {
+    placeholder: `Model override (default: ${providerInfo.default_models.anthropic || "provider default"})`,
+    style: "width:100%; margin-bottom:6px;",
+  });
+  const aiBaseUrlInput = el("input", {
+    placeholder: "Ollama server URL (default http://127.0.0.1:11434)",
+    style: "width:100%; margin-bottom:6px; display:none;",
+  });
+  panel.appendChild(aiModelInput);
+  panel.appendChild(aiBaseUrlInput);
+  const aiBtn = el("button", { class: "secondary", text: "Ask AI Assistant" });
+  panel.appendChild(aiBtn);
+
+  aiProviderSelect.addEventListener("change", () => {
+    const p = aiProviderSelect.value;
+    aiKeyInput.placeholder = PROVIDER_KEY_HINTS[p] || "API key";
+    aiKeyInput.style.display = p === "ollama" ? "none" : "";
+    aiBaseUrlInput.style.display = p === "ollama" ? "" : "none";
+    aiModelInput.placeholder = `Model override (default: ${providerInfo.default_models[p] || "provider default"})`;
+  });
+
+  aiBtn.addEventListener("click", async () => {
+    aiBtn.disabled = true;
+    aiBox.innerHTML = "";
+    aiBox.appendChild(el("div", { class: "loading", text: "Asking…" }));
+    try {
+      const body = {
+        entity_type: result.entity.entity_type,
+        value: result.entity.value,
+        provider: aiProviderSelect.value,
+      };
+      if (aiKeyInput.value.trim()) body.api_key = aiKeyInput.value.trim();
+      if (aiModelInput.value.trim()) body.model = aiModelInput.value.trim();
+      if (aiBaseUrlInput.value.trim()) body.base_url = aiBaseUrlInput.value.trim();
+      const h = await apiPost(`/cases/${c.case_id}/ai-hypothesis`, body);
+      aiBox.innerHTML = "";
+      const box = el("div", { class: "hypothesis-box" });
+      if (!h.evidence_sufficient) {
+        box.innerHTML = `
+          <div class="k">Claim</div><div>${escapeHtml(h.claim)}</div>
+          <div class="k">Recommended validation</div><div>${escapeHtml(h.recommended_validation)}</div>`;
+      } else {
+        const citations = h.evidence.map((x) => `${escapeHtml(x.evidence_id)}/${escapeHtml(x.event_id)}`).join(", ") || "none";
+        box.innerHTML = `
+          <div class="k">Assessment</div><div>${escapeHtml(h.assessment)}</div>
+          <div class="k">Claim</div><div>${escapeHtml(h.claim)}</div>
+          <div class="k">Confidence</div><div><span class="badge badge-${cssClass(h.confidence)}">${escapeHtml(h.confidence)}</span></div>
+          <div class="k">Observed Evidence</div><div>${h.observed_evidence.map((x) => "&bull; " + escapeHtml(x)).join("<br>")}</div>
+          <div class="k">Alternative Explanation</div><div>${escapeHtml(h.alternative_explanation)}</div>
+          <div class="k">Recommended Validation</div><div>${escapeHtml(h.recommended_validation)}</div>
+          <div class="k">Cited Evidence</div><div class="mono">${citations}</div>
+          <div style="margin-top:8px; color: var(--text-dim); font-size:11px;">
+            AI-generated hypothesis, not a conclusion - review the cited events yourself.
+          </div>`;
+      }
+      aiBox.appendChild(box);
+    } catch (e) {
+      aiBox.innerHTML = "";
+      aiBox.appendChild(el("div", { class: "error-box", text: e.message }));
+    } finally {
+      aiBtn.disabled = false;
+    }
+  });
+}
+
+// --- Entity graph rendering (simple radial layout, no external libs) ---
+
+function drawGraph(canvas, center, related) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width,
+    h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2,
+    cy = h / 2;
+
+  const items = related.slice(0, 24);
+  const maxCount = Math.max(1, ...items.map((r) => r.shared_event_count));
+  const n = items.length;
+  const nodes = items.map((r, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(1, n);
+    const strength = r.shared_event_count / maxCount;
+    const radius = 170 - strength * 90; // stronger relationship = drawn closer to center
+    return { r, angle, x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius };
+  });
+
+  ctx.strokeStyle = "rgba(91,157,255,0.35)";
+  ctx.lineWidth = 1;
+  for (const node of nodes) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(node.x, node.y);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#5b9dff";
+  ctx.beginPath();
+  ctx.arc(cx, cy, 14, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.fillStyle = "#e6e8ef";
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(truncate(center.value, 22), cx, cy - 20);
+
+  for (const node of nodes) {
+    ctx.fillStyle = colorForType(node.r.entity_type);
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, 8, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillStyle = "#9aa0b4";
+    ctx.font = "10px sans-serif";
+    const labelY = node.y + (node.y > cy ? 18 : -12);
+    ctx.fillText(truncate(node.r.value, 18), node.x, labelY);
+  }
+
+  if (n === 0) {
+    ctx.fillStyle = "#9aa0b4";
+    ctx.font = "13px sans-serif";
+    ctx.fillText("No related entities", cx, cy + 40);
+  }
+}
+
+function truncate(s, n) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function colorForType(t) {
+  const colors = {
+    ip_address: "#5b9dff",
+    user: "#4caf50",
+    hostname: "#e0a030",
+    domain: "#c084fc",
+    hash: "#e05a4e",
+    file: "#e05a4e",
+    process: "#4caf50",
+    port: "#9aa0b4",
+    network_connection: "#5b9dff",
+    device: "#e0a030",
+    url: "#c084fc",
+  };
+  return colors[t] || "#9aa0b4";
+}
+
+// --- Host dossier: everything one host did, on one screen ---------------
+
+async function renderHostDossier(app, c, entityId) {
+  app.appendChild(el("h1", { text: "Host" }));
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+
+  if (!entityId) {
+    panel.appendChild(el("div", { class: "empty", text: "No host selected." }));
+    return;
+  }
+
+  await loadInto(panel, () => apiGet(`/cases/${c.case_id}/entities/${entityId}/dossier`), (d) =>
+    hostDossierBody(c, d)
+  );
+}
+
+function hostDossierBody(c, d) {
+  const wrap = el("div", { class: "dossier" });
+  const s = d.summary;
+  const onNet = d.entity.on_network;
+
+  // Retitle the page with the host itself now that we have it.
+  const h1 = document.querySelector("#app h1");
+  if (h1) h1.textContent = d.entity.value;
+
+  const head = el("div", { class: "dossier-head" });
+  head.appendChild(el("span", { class: "mono dossier-ip", text: d.entity.value }));
+  head.appendChild(
+    el("span", {
+      class: "badge " + (onNet ? "badge-medium" : "badge-none"),
+      text: onNet ? "On your network" : "External",
+    })
+  );
+  const ti = (d.threat_intel || []).find((t) => t.malicious);
+  if (ti) head.appendChild(el("span", { class: "badge badge-critical", text: "Flagged by threat intel" }));
+  wrap.appendChild(head);
+
+  // The numbers that characterise the host at a glance.
+  const stats = el("div", { class: "dossier-stats" });
+  const stat = (label, value) =>
+    el("div", { class: "dossier-stat" }, [
+      el("div", { class: "dossier-stat-v", text: value }),
+      el("div", { class: "dossier-stat-l", text: label }),
+    ]);
+  stats.appendChild(stat("events", String(s.events)));
+  stats.appendChild(stat("peers", String(s.peer_count)));
+  stats.appendChild(stat("sent", fmtBytes(s.bytes_sent) || "0 B"));
+  stats.appendChild(stat("received", fmtBytes(s.bytes_received) || "0 B"));
+  if (s.first_seen) stats.appendChild(stat("first seen", timelineTime(s.first_seen)));
+  if (s.last_seen) stats.appendChild(stat("last seen", timelineTime(s.last_seen)));
+  wrap.appendChild(stats);
+
+  const actions = el("div", { class: "dossier-actions" });
+  actions.appendChild(
+    el("a", { class: "button-link secondary", href: `#/case/${c.case_id}/entities/${d.entity.entity_id}`, text: "Open in entity graph →" })
+  );
+  wrap.appendChild(actions);
+
+  // Findings that fired on this host - the first thing to read.
+  wrap.appendChild(dossierSection("Findings on this host", d.findings.length,
+    d.findings.length
+      ? d.findings.map((f) => {
+          const row = el("div", { class: "dossier-finding sev-" + cssClass(f.severity) });
+          row.appendChild(el("span", { class: "badge badge-" + cssClass(f.severity), text: f.severity }));
+          row.appendChild(el("span", { class: "dossier-finding-title", text: f.title }));
+          if (f.occurrences > 1) row.appendChild(el("span", { class: "dim", text: "×" + f.occurrences }));
+          return row;
+        })
+      : [el("div", { class: "dim", text: "No detections fired on this host." })]
+  ));
+
+  // Who it talked to.
+  wrap.appendChild(dossierSection("Who it talked to", d.peer_total,
+    d.peers.length
+      ? [peerTable(c, d.peers)].concat(
+          d.peer_total > d.peers.length
+            ? [el("div", { class: "dim", text: `Showing the top ${d.peers.length} of ${d.peer_total} by volume.` })]
+            : []
+        )
+      : [el("div", { class: "dim", text: "No peers recorded." })]
+  ));
+
+  // Services it reached.
+  if (d.services.length) {
+    wrap.appendChild(dossierSection("Services it reached", d.services.length,
+      [chipRow(d.services.map((sv) => `${sv.port}${sv.protocol ? "/" + sv.protocol : ""} · ${sv.events}`))]
+    ));
+  }
+
+  // Domains.
+  if (d.domains.length) {
+    wrap.appendChild(dossierSection("Domains", d.domains.length,
+      [el("div", { class: "dossier-domains" }, d.domains.map((dm, i) => {
+        const frag = el("span", {});
+        if (i > 0) frag.appendChild(el("span", { text: ", " }));
+        if (dm.entity_id) {
+          frag.appendChild(el("a", { class: "host-link mono", href: `#/case/${c.case_id}/entities/${dm.entity_id}`, text: dm.value }));
+        } else {
+          frag.appendChild(el("span", { class: "mono dim", text: dm.value }));
+        }
+        frag.appendChild(el("span", { class: "dim", text: ` (${dm.events})` }));
+        return frag;
+      }))]
+    ));
+  }
+
+  // Files seen with this host.
+  if (d.files.length) {
+    wrap.appendChild(dossierSection("Files seen with this host", d.files.length,
+      [el("div", { class: "dossier-files" }, d.files.slice(0, 30).map((f) =>
+        el("div", { class: "dossier-file" }, [
+          el("span", { class: "badge badge-none", text: f.direction }),
+          el("span", { class: "mono", text: f.name || f.hash || "(unnamed)" }),
+        ])
+      ))].concat([el("div", { class: "dim" }, [
+        el("a", { href: `#/case/${c.case_id}/files`, text: "Open Recovered files →" }),
+      ])])
+    ));
+  }
+
+  return wrap;
+}
+
+function dossierSection(title, count, children) {
+  const sec = el("div", { class: "dossier-section" });
+  const h = el("h3", {}, [
+    el("span", { text: title }),
+    count ? el("span", { class: "dossier-count", text: String(count) }) : null,
+  ].filter(Boolean));
+  sec.appendChild(h);
+  for (const child of children) sec.appendChild(child);
+  return sec;
+}
+
+function peerTable(c, peers) {
+  const table = el("table");
+  const thead = el("tr", {}, [
+    el("th", { text: "Host" }),
+    el("th", { text: "Where" }),
+    el("th", { text: "Events" }),
+    el("th", { text: "Sent" }),
+    el("th", { text: "Received" }),
+  ]);
+  table.appendChild(thead);
+  for (const p of peers) {
+    const nameCell = el("td", {});
+    if (p.entity_id) {
+      nameCell.appendChild(el("a", { class: "host-link mono", href: `#/case/${c.case_id}/host/${p.entity_id}`, text: p.value }));
+    } else {
+      nameCell.appendChild(el("span", { class: "mono dim", text: p.value }));
+    }
+    table.appendChild(
+      el("tr", {}, [
+        nameCell,
+        el("td", {}, [el("span", { class: "badge " + (p.external ? "badge-none" : "badge-medium"), text: p.external ? "external" : "on network" })]),
+        el("td", { text: String(p.events) }),
+        el("td", { class: "mono", text: fmtBytes(p.bytes_sent) || "0 B" }),
+        el("td", { class: "mono", text: fmtBytes(p.bytes_received) || "0 B" }),
+      ])
+    );
+  }
+  return table;
+}
+
+function chipRow(labels) {
+  const row = el("div", { class: "chip-row" });
+  for (const label of labels) row.appendChild(el("span", { class: "chip mono", text: label }));
+  return row;
+}
+
+// --- Chain of custody (append-only; this view is strictly read-only) ---
+
+async function renderAudit(app, c) {
+  app.appendChild(el("h1", { text: "Chain of Custody" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Every action taken on this case, in order, with who did it and when. Entries are hash-chained, " +
+        "so editing or removing one is detectable. This detects accidental corruption and casual " +
+        "after-the-fact editing - not someone who controls the machine, who could recompute the chain.",
+    })
+  );
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+  panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+
+  try {
+    const data = await apiGet(`/cases/${c.case_id}/audit`);
+    panel.innerHTML = "";
+
+    if (data.intact) {
+      panel.appendChild(
+        el("div", {
+          class: "lead",
+          text: `Chain intact - ${data.entries.length} recorded action(s) verified.`,
+        })
+      );
+    } else {
+      const box = el("div", { class: "error-box" });
+      box.appendChild(el("div", { text: "WARNING - the chain of custody does not verify:" }));
+      for (const problem of data.problems) box.appendChild(el("div", { text: "• " + problem }));
+      panel.appendChild(box);
+    }
+
+    if (!data.entries.length) {
+      panel.appendChild(el("div", { class: "empty", text: "No actions recorded yet." }));
+      return;
+    }
+
+    const table = el("table");
+    table.innerHTML =
+      "<tr><th>#</th><th>Timestamp (UTC)</th><th>Actor</th><th>Action</th><th>Details</th></tr>" +
+      data.entries
+        .map((e) => {
+          const details = Object.entries(e.details || {})
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ");
+          return `<tr>
+            <td>${e.sequence}</td>
+            <td class="mono">${escapeHtml(String(e.timestamp || "").slice(0, 19).replace("T", " "))}</td>
+            <td>${escapeHtml(e.actor || "")}</td>
+            <td class="mono">${escapeHtml(e.action || "")}</td>
+            <td>${escapeHtml(details)}</td>
+          </tr>`;
+        })
+        .join("");
+    panel.appendChild(table);
+  } catch (e) {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+  }
+}
+
+// --- Detections (bundled offline rules - read-only, recomputed by Analyze) ---
+
+// --- Threat intel: import indicators, see which ones the evidence touched ---
+//
+// Every value on this page comes from a feed somebody else wrote, so all of
+// it is set with textContent and never innerHTML. A "note" field in a shared
+// MISP export is exactly where a stored-XSS payload would ride in.
+
+function iocSummary(c, s) {
+  const box = el("div", { class: "ioc-result" });
+  const byType = Object.entries(s.by_type || {})
+    .map(([t, n]) => `${n} ${t}`)
+    .join(", ");
+  box.appendChild(
+    el("div", {
+      text: `${s.source} (${s.feed_format}) - added ${s.added}${byType ? ` (${byType})` : ""}, ${s.total_indicators} now in case.`,
+    })
+  );
+  if (s.already_present) box.appendChild(el("div", { class: "dim", text: `${s.already_present} were already in this case.` }));
+  if (s.duplicates_in_feed) box.appendChild(el("div", { class: "dim", text: `${s.duplicates_in_feed} duplicate line(s) in the feed.` }));
+  if (s.skipped_non_ids) {
+    box.appendChild(
+      el("div", {
+        class: "dim",
+        text: `${s.skipped_non_ids} MISP attribute(s) skipped: to_ids is false, which the feed author uses to mark context that should not alert.`,
+      })
+    );
+  }
+  if (s.rejected_count) {
+    const wrap = el("div", { class: "warn-note" });
+    wrap.appendChild(el("div", { text: `${s.rejected_count} line(s) refused:` }));
+    const list = el("ul");
+    for (const r of (s.rejected || []).slice(0, 10)) {
+      const li = el("li");
+      li.appendChild(el("span", { class: "mono", text: r.value }));
+      li.appendChild(document.createTextNode(` - ${r.reason}`));
+      list.appendChild(li);
+    }
+    wrap.appendChild(list);
+    if (s.rejected_count > 10) wrap.appendChild(el("div", { class: "dim", text: `...and ${s.rejected_count - 10} more.` }));
+    box.appendChild(wrap);
+  }
+  const matched = el("div", { class: s.match_count ? "ioc-matched" : "dim" });
+  if (s.match_count) {
+    matched.appendChild(document.createTextNode(`${s.match_count} indicator(s) matched the evidence. `));
+    matched.appendChild(el("a", { href: `#/case/${c.case_id}/story`, text: "See them in What happened →" }));
+  } else {
+    matched.textContent = "No indicator matched the evidence in this case.";
+  }
+  box.appendChild(matched);
+  return box;
+}
+
+async function renderIocs(app, c) {
+  app.appendChild(el("h1", { text: "Threat intel" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Import indicators from a feed - plain text, CSV, STIX 2.1 or MISP JSON - and each one the evidence touches becomes a " +
+        "detection that leads the story. Defanged values (hxxp://, evil[.]com) are accepted, refused lines say why, and the " +
+        "feed's SHA-256 goes into the chain of custody. Nothing is fetched from the network.",
+    })
+  );
+
+  const importCard = el("div", { class: "card ioc-import" });
+  importCard.appendChild(el("div", { class: "card-head" }, [el("h3", { text: "Import a feed" })]));
+  const row = el("div", { class: "ioc-import-row" });
+  const fileInput = el("input", { type: "file", accept: ".txt,.csv,.json,.list,.ioc", "aria-label": "Indicator feed file" });
+  const sourceInput = el("input", { type: "text", placeholder: "Feed name (defaults to the file name)", "aria-label": "Feed name" });
+  const importBtn = el("button", { text: "Import and match" });
+  row.appendChild(fileInput);
+  row.appendChild(sourceInput);
+  row.appendChild(importBtn);
+  importCard.appendChild(row);
+  const resultSlot = el("div");
+  importCard.appendChild(resultSlot);
+  app.appendChild(importCard);
+
+  const listCard = el("div", { class: "card" });
+  app.appendChild(listCard);
+
+  function renderList(data) {
+    listCard.innerHTML = "";
+    const head = el("div", { class: "card-head" });
+    head.appendChild(el("h3", { text: "Indicators in this case" }));
+    head.appendChild(el("span", { class: "dim", text: `${data.total} imported · ${data.matched} matched` }));
+    if (data.total) {
+      const clearBtn = el("button", { class: "danger", text: "Remove all" });
+      clearBtn.onclick = async () => {
+        if (!window.confirm(`Remove all ${data.total} indicators from ${c.case_id}? Their matches are removed with them.`)) return;
+        try {
+          const r = await apiDelete(`/cases/${c.case_id}/iocs`, {});
+          toast(`Removed ${r.removed} indicator(s)`);
+          resultSlot.innerHTML = "";
+          loadList();
+        } catch (e) {
+          toast("Could not remove indicators: " + e.message, true);
+        }
+      };
+      head.appendChild(el("span", { class: "right" }, [clearBtn]));
+    }
+    listCard.appendChild(head);
+
+    if (!data.total) {
+      listCard.appendChild(el("div", { class: "empty", text: "No indicators yet. Import a feed above." }));
+      return;
+    }
+
+    // Matched first: the indicators the evidence touched are the reason
+    // anyone opens this page.
+    const rows = [...data.indicators].sort((a, b) => Number(b.matched) - Number(a.matched));
+    const wrap = el("div", { class: "table-wrap" });
+    const table = el("table", { class: "ioc-table" });
+    const thead = el("thead");
+    thead.appendChild(el("tr", {}, ["Match", "Type", "Indicator", "Source"].map((h) => el("th", { text: h }))));
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    for (const item of rows) {
+      const tr = el("tr", { class: item.matched ? "ioc-row-hit" : "" });
+      tr.appendChild(
+        el("td", {}, [
+          item.matched ? el("span", { class: "badge badge-high", text: "seen" }) : el("span", { class: "dim", text: "-" }),
+        ])
+      );
+      tr.appendChild(el("td", { class: "mono dim", text: item.ioc_type }));
+      const valueCell = el("td");
+      valueCell.appendChild(el("div", { class: "mono ioc-value", text: item.value }));
+      if (item.description) valueCell.appendChild(el("div", { class: "dim", text: item.description }));
+      if (item.matched && item.match_description) {
+        valueCell.appendChild(el("div", { class: "ioc-match-note", text: item.match_description }));
+      }
+      tr.appendChild(valueCell);
+      tr.appendChild(el("td", { class: "dim", text: item.source || "" }));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    listCard.appendChild(wrap);
+  }
+
+  async function loadList() {
+    listCard.innerHTML = "";
+    listCard.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    try {
+      renderList(await apiGet(`/cases/${c.case_id}/iocs`));
+    } catch (e) {
+      listCard.innerHTML = "";
+      listCard.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  importBtn.onclick = async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      toast("Choose a feed file first.", true);
+      return;
+    }
+    const form = new FormData();
+    form.append("file", file);
+    if (sourceInput.value.trim()) form.append("source", sourceInput.value.trim());
+    importBtn.disabled = true;
+    importBtn.textContent = "Importing…";
+    resultSlot.innerHTML = "";
+    try {
+      const summary = await apiUpload(`/cases/${c.case_id}/iocs`, form);
+      resultSlot.appendChild(iocSummary(c, summary));
+      renderList(summary.case);
+      toast(`Imported ${summary.added} indicator(s), ${summary.match_count} matched`);
+    } catch (e) {
+      resultSlot.appendChild(el("div", { class: "error-box", text: e.message }));
+    } finally {
+      importBtn.disabled = false;
+      importBtn.textContent = "Import and match";
+    }
+  };
+
+  loadList();
+}
+async function renderDetections(app, c) {
+  app.appendChild(el("h1", { text: "Detections" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Local, deterministic pattern matches - no AI, no external network call. Recomputed automatically every " +
+        "time you run Analyze; a flag pointing at evidence worth a look, never a claim that something malicious happened.",
+    })
+  );
+
+  const filterBar = el("div", { class: "filter-bar" });
+  const severitySelect = selectEl(["", "high", "medium", "low"], "");
+  severitySelect.querySelector('option[value=""]').textContent = "All severities";
+  filterBar.appendChild(severitySelect);
+  app.appendChild(filterBar);
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+
+  async function loadList() {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    try {
+      const query = severitySelect.value ? `?severity=${encodeURIComponent(severitySelect.value)}` : "";
+      const detections = await apiGet(`/cases/${c.case_id}/detections${query}`);
+      panel.innerHTML = "";
+      if (!detections.length) {
+        panel.appendChild(
+          el("div", { class: "empty", text: "No detections. Run `trusttrace analyze` to (re)scan." })
+        );
+        return;
+      }
+      const table = el("table");
+      table.innerHTML =
+        "<tr><th>Severity</th><th>Rule</th><th>Event</th><th>Description</th></tr>" +
+        detections
+          .map(
+            (d) => `<tr>
+          <td><span class="badge badge-${cssClass(d.severity)}">${escapeHtml(d.severity)}</span></td>
+          <td class="mono">${escapeHtml(d.rule_name)}</td>
+          <td class="mono">${escapeHtml(d.evidence_id)}/${escapeHtml(d.event_id)}</td>
+          <td>${escapeHtml(d.description)}</td>
+        </tr>`
+          )
+          .join("");
+      panel.appendChild(table);
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  severitySelect.addEventListener("change", loadList);
+  await loadList();
+}
+
+// --- Findings ---
+
+const FINDING_STATUSES = ["Open", "Investigating", "Confirmed", "Rejected", "False Positive", "Resolved"];
+const FINDING_SEVERITIES = ["Low", "Medium", "High", "Critical"];
+
+function selectEl(options, selected) {
+  const s = el("select");
+  for (const opt of options) {
+    const o = el("option", { value: opt, text: opt });
+    if (opt === selected) o.setAttribute("selected", "selected");
+    s.appendChild(o);
+  }
+  return s;
+}
+
+async function renderFindings(app, c) {
+  app.appendChild(el("h1", { text: "Findings" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text: "Investigator-owned - nothing here is inferred or auto-generated. Creating or updating a finding here is the same explicit action as `trusttrace finding create/update`.",
+    })
+  );
+
+  // --- create form ---
+  const createPanel = el("div", { class: "panel" });
+  createPanel.appendChild(el("h3", { text: "New Finding" }));
+  const titleInput = el("input", { type: "text", placeholder: "Title", style: "min-width:260px;" });
+  const severitySelect = selectEl(FINDING_SEVERITIES, "Medium");
+  const statusSelect = selectEl(FINDING_STATUSES, "Open");
+  const assessmentInput = el("textarea", {
+    placeholder: "Assessment (free text)",
+    rows: "3",
+    style: "width:100%; background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; margin-top:8px; font-family:inherit; font-size:13px;",
+  });
+  const eventIdsInput = el("input", {
+    type: "text",
+    placeholder: "Event IDs this is based on, comma-separated (optional)",
+    style: "width:100%; margin-top:8px;",
+  });
+  const createRow = el("div", { class: "filter-bar", style: "margin-top:0;" });
+  createRow.appendChild(titleInput);
+  createRow.appendChild(severitySelect);
+  createRow.appendChild(statusSelect);
+  const createBtn = el("button", { text: "Create Finding" });
+  createRow.appendChild(createBtn);
+  createPanel.appendChild(createRow);
+  createPanel.appendChild(assessmentInput);
+  createPanel.appendChild(eventIdsInput);
+  app.appendChild(createPanel);
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+
+  async function loadList() {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+    try {
+      const findings = await apiGet(`/cases/${c.case_id}/findings`);
+      panel.innerHTML = "";
+      if (!findings.length) {
+        panel.appendChild(el("div", { class: "empty", text: "No findings recorded yet." }));
+        return;
+      }
+      for (const f of findings) {
+        panel.appendChild(renderFindingCard(f));
+      }
+    } catch (e) {
+      panel.innerHTML = "";
+      panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  function renderFindingCard(f) {
+    const evidenceList = f.evidence_refs.map((r) => `${escapeHtml(r.evidence_id)}/${escapeHtml(r.event_id)}`).join(", ") || "none";
+    const notesHtml = f.investigator_notes.length
+      ? `<div style="margin-top:8px;"><h3>Notes</h3>` +
+        f.investigator_notes
+          .map((n) => `<div class="lead">${escapeHtml(n.timestamp)} (${escapeHtml(n.author)}): ${escapeHtml(n.text)}</div>`)
+          .join("") +
+        `</div>`
+      : "";
+    const card = el("div", { class: "panel", style: "margin-bottom:10px;" });
+    card.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><b>${escapeHtml(f.finding_id)}</b> &middot; ${escapeHtml(f.title)}</div>
+        <div>
+          <span class="badge badge-${cssClass(f.status)}">${escapeHtml(f.status)}</span>
+          <span class="badge badge-${cssClass(f.severity)}">${escapeHtml(f.severity)}</span>
+        </div>
+      </div>
+      <div style="color:var(--text-dim); margin-top:6px;">${escapeHtml(f.assessment || "(no assessment)")}</div>
+      <div style="margin-top:6px; font-size:12px;" class="mono">Evidence: ${evidenceList}</div>
+      ${notesHtml}`;
+
+    const updateRow = el("div", { class: "filter-bar", style: "margin-top:10px;" });
+    const newStatusSelect = selectEl(FINDING_STATUSES, f.status);
+    const statusBtn = el("button", { class: "secondary", text: "Update Status" });
+    updateRow.appendChild(newStatusSelect);
+    updateRow.appendChild(statusBtn);
+    card.appendChild(updateRow);
+
+    const noteRow = el("div", { class: "filter-bar" });
+    const noteInput = el("input", { type: "text", placeholder: "Add a note…", style: "min-width:300px;" });
+    const noteBtn = el("button", { class: "secondary", text: "Add Note" });
+    noteRow.appendChild(noteInput);
+    noteRow.appendChild(noteBtn);
+    card.appendChild(noteRow);
+
+    statusBtn.addEventListener("click", async () => {
+      statusBtn.disabled = true;
+      try {
+        await apiPost(`/cases/${c.case_id}/findings/${f.finding_id}`, { status: newStatusSelect.value });
+        toast(`${f.finding_id} status updated to ${newStatusSelect.value}.`);
+        await loadList();
+      } catch (e) {
+        toast("Update failed: " + e.message, true);
+      } finally {
+        statusBtn.disabled = false;
+      }
+    });
+
+    noteBtn.addEventListener("click", async () => {
+      if (!noteInput.value.trim()) {
+        toast("Enter a note first.", true);
+        return;
+      }
+      noteBtn.disabled = true;
+      try {
+        await apiPost(`/cases/${c.case_id}/findings/${f.finding_id}`, { note: noteInput.value.trim() });
+        toast(`Note added to ${f.finding_id}.`);
+        await loadList();
+      } catch (e) {
+        toast("Add note failed: " + e.message, true);
+      } finally {
+        noteBtn.disabled = false;
+      }
+    });
+
+    return card;
+  }
+
+  createBtn.addEventListener("click", async () => {
+    if (!titleInput.value.trim()) {
+      toast("Enter a title first.", true);
+      return;
+    }
+    createBtn.disabled = true;
+    try {
+      const eventIds = eventIdsInput.value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const finding = await apiPost(`/cases/${c.case_id}/findings`, {
+        title: titleInput.value.trim(),
+        severity: severitySelect.value,
+        status: statusSelect.value,
+        assessment: assessmentInput.value.trim(),
+        event_ids: eventIds,
+      });
+      toast(`Created ${finding.finding_id}.`);
+      titleInput.value = "";
+      assessmentInput.value = "";
+      eventIdsInput.value = "";
+      await loadList();
+    } catch (e) {
+      toast("Create failed: " + e.message, true);
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+
+  await loadList();
+}
+
+// --- ATT&CK (read-only here - run/validate via `trusttrace attack scan|update`) ---
+
+async function renderAttack(app, c) {
+  app.appendChild(el("h1", { text: "ATT&CK Mapping" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Deterministic, evidence-cited technique suggestions - never an automated claim that a technique " +
+        "occurred. Run `trusttrace attack scan --case " +
+        c.case_id +
+        "` to (re)scan, and `trusttrace attack update` to confirm or reject a mapping.",
+    })
+  );
+
+  const panel = el("div", { class: "panel" });
+  app.appendChild(panel);
+  panel.appendChild(el("div", { class: "loading", text: "Loading…" }));
+  try {
+    const techniques = await apiGet(`/cases/${c.case_id}/attack`);
+    panel.innerHTML = "";
+    if (!techniques.length) {
+      panel.appendChild(
+        el("div", { class: "empty", text: "No potential ATT&CK techniques detected. Run `trusttrace attack scan`." })
+      );
+      return;
+    }
+    const table = el("table");
+    table.innerHTML =
+      "<tr><th>Technique</th><th>Name</th><th>Confidence</th><th>Status</th><th>Events</th></tr>" +
+      techniques
+        .map(
+          (t) => `<tr>
+        <td class="mono">${escapeHtml(t.technique_id)}</td>
+        <td>${escapeHtml(t.technique_name)}</td>
+        <td><span class="badge badge-${cssClass(t.confidence)}">${escapeHtml(t.confidence)}</span></td>
+        <td><span class="badge badge-${cssClass(t.status)}">${escapeHtml(t.status)}</span></td>
+        <td>${t.event_count}</td>
+      </tr>`
+        )
+        .join("");
+    panel.appendChild(table);
+  } catch (e) {
+    panel.innerHTML = "";
+    panel.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+  }
+}
+
+// --- Reports ---
+
+async function renderReports(app, c) {
+  app.appendChild(el("h1", { text: "Reports" }));
+  const tabs = el("div", { class: "report-tabs" });
+  const formats = ["markdown", "json", "html"];
+  const body = el("div", { class: "report-body" });
+  app.appendChild(tabs);
+  app.appendChild(body);
+
+  async function show(fmt) {
+    tabs.querySelectorAll("button").forEach((b) => b.classList.toggle("secondary", b.dataset.fmt !== fmt));
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "loading", text: `Generating ${fmt} report...` }));
+    try {
+      const res = await fetch(`/api/cases/${c.case_id}/report/${fmt}`);
+      const text = await res.text();
+      if (!res.ok) throw new Error(JSON.parse(text).error || res.statusText);
+      body.innerHTML = "";
+      if (fmt === "html") {
+        const iframe = el("iframe", { sandbox: "" });
+        body.appendChild(iframe);
+        iframe.srcdoc = text;
+      } else {
+        body.appendChild(el("pre", { text }));
+      }
+    } catch (e) {
+      body.innerHTML = "";
+      body.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    }
+  }
+
+  for (const fmt of formats) {
+    const btn = el("button", { text: fmt, onclick: () => show(fmt) });
+    btn.dataset.fmt = fmt;
+    tabs.appendChild(btn);
+  }
+  await show("markdown");
+}
+
+// --- Live Capture ---
+//
+// Polled (not streamed via SSE): the server runs single-threaded so DuckDB
+// access from the web request thread and a capture session's background
+// ingestion thread stay serialized through one lock - see web/app.py.
+// ~1.5s polling is plenty responsive for this dashboard.
+
+async function renderCapture(app, c) {
+  app.appendChild(el("h1", { text: "Live Capture" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Captures real traffic on the chosen interface into rotating pcap windows, each auto-ingested as " +
+        "case evidence when it completes. Needs a packet-capture driver (Npcap/libpcap) and elevated " +
+        "privileges on the machine running `trusttrace web` - this UI does not grant those.",
+    })
+  );
+
+  const controlBar = el("div", { class: "filter-bar" });
+  const interfaceSelect = el("select", {});
+  interfaceSelect.innerHTML = '<option value="">Loading interfaces...</option>';
+  const filterInput = el("input", { placeholder: "BPF filter, e.g. tcp port 443" });
+  const rotateInput = el("input", { type: "number", value: "30", min: "5", style: "width:80px;" });
+  const rotateLabel = el("span", { text: "sec/window", style: "color:var(--text-dim); font-size:12px;" });
+  const startBtn = el("button", { text: "Start Capture" });
+  const stopBtn = el("button", { class: "secondary", text: "Stop Capture" });
+  stopBtn.disabled = true;
+  controlBar.appendChild(interfaceSelect);
+  controlBar.appendChild(filterInput);
+  controlBar.appendChild(rotateInput);
+  controlBar.appendChild(rotateLabel);
+  controlBar.appendChild(startBtn);
+  controlBar.appendChild(stopBtn);
+  app.appendChild(controlBar);
+
+  const statusPanel = el("div", { class: "panel" });
+  statusPanel.appendChild(el("div", { class: "empty", text: "Not running." }));
+  app.appendChild(statusPanel);
+
+  const feedPanel = el("div", { class: "panel" });
+  feedPanel.appendChild(el("h3", { text: "Ingested Windows" }));
+  const feedList = el("div");
+  feedPanel.appendChild(feedList);
+  app.appendChild(feedPanel);
+
+  apiGet("/interfaces")
+    .then((interfaces) => {
+      interfaceSelect.innerHTML = interfaces.length
+        ? interfaces
+            .map((i) => {
+              // dumpcap supplies a human description; scapy does not.
+              // Showing it is what makes a Windows \\Device\\NPF_{GUID}
+              // identifiable as a particular NIC.
+              const label = i.description ? `${i.name} (${i.description})` : i.name;
+              return `<option value="${escapeHtml(i.name)}">${escapeHtml(label)}</option>`;
+            })
+            .join("")
+        : '<option value="">(none found)</option>';
+    })
+    .catch((e) => {
+      interfaceSelect.innerHTML = '<option value="">(could not list interfaces)</option>';
+      toast("Could not list interfaces: " + e.message, true);
+    });
+
+  function renderStatus(snap) {
+    statusPanel.innerHTML = "";
+    if (!snap.running) {
+      statusPanel.appendChild(el("div", { class: "empty", text: "Not running." }));
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      return;
+    }
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+
+    const stats = el("div", { class: "grid-stats" });
+    const defs = [
+      ["Total Packets", snap.total_packet_count],
+      ["Window Packets", snap.window_packet_count],
+      ["Window Bytes", snap.window_byte_count],
+      ["Window Age (s)", Math.round(snap.window_elapsed_seconds)],
+      ["Elapsed (s)", Math.round(snap.elapsed_seconds)],
+    ];
+    for (const [l, n] of defs) {
+      stats.appendChild(el("div", { class: "stat" }, [el("div", { class: "n", text: n }), el("div", { class: "l", text: l })]));
+    }
+    statusPanel.appendChild(stats);
+
+    // Name the interface actually being captured. When none was chosen it is
+    // the backend's own pick, which is frequently a virtual or disconnected
+    // adapter - and a capture on the wrong one looks exactly like a quiet
+    // network unless the name and the empty-window streak are both visible.
+    if (snap.capturing_on) {
+      statusPanel.appendChild(
+        el("div", {
+          style: "margin-top:8px;font-size:12px;opacity:0.75;",
+          text: "Capturing on: " + snap.capturing_on + (snap.engine ? " (" + snap.engine + " engine)" : ""),
+        })
+      );
+    }
+    if (snap.consecutive_empty_windows >= 3) {
+      statusPanel.appendChild(
+        el("div", {
+          style: "margin-top:8px;color:#e0a030;",
+          text:
+            snap.consecutive_empty_windows +
+            " consecutive windows captured no packets. If traffic is expected, the interface is probably wrong.",
+        })
+      );
+    }
+
+    const protoEntries = Object.entries(snap.window_protocols || {});
+    if (protoEntries.length) {
+      const protoBox = el("div", { style: "margin-top:12px;" });
+      protoBox.appendChild(el("h3", { text: "Current Window - Protocol Breakdown" }));
+      for (const [proto, count] of protoEntries.sort((a, b) => b[1] - a[1])) {
+        protoBox.appendChild(el("div", { class: "lead", text: `${proto}: ${count}` }));
+      }
+      statusPanel.appendChild(protoBox);
+    }
+  }
+
+  // Evidence IDs already toasted, so a window's detections alert fires
+  // once - not on every ~1.5s poll for as long as that window stays in
+  // recent_events. Scoped to this renderCapture() call, so navigating
+  // away and back (or reloading) starts fresh, which is fine.
+  const alertedEvidenceIds = new Set();
+
+  function renderFeed(events) {
+    feedList.innerHTML = "";
+    if (!events || !events.length) {
+      feedList.appendChild(el("div", { class: "empty", text: "No windows ingested yet." }));
+      return;
+    }
+    for (const evt of [...events].reverse()) {
+      if (evt.error) {
+        feedList.appendChild(el("div", { class: "lead error-box", text: `${evt.at}: error - ${evt.error}` }));
+        continue;
+      }
+      const line = `${evt.at}: ${evt.evidence_id} - ${evt.packet_count} packets -> ${evt.event_count} events, ${evt.entity_count} entities`;
+      feedList.appendChild(el("div", { class: "lead", text: line }));
+
+      if (evt.new_detections && evt.new_detections.length) {
+        const bySeverity = {};
+        for (const d of evt.new_detections) bySeverity[d.severity] = (bySeverity[d.severity] || 0) + 1;
+        const summary = Object.entries(bySeverity)
+          .map(([s, n]) => `${n} ${s}`)
+          .join(", ");
+        const ruleNames = evt.new_detections.map((d) => d.rule_name).join("; ");
+        feedList.appendChild(
+          el("div", {
+            class: "lead error-box",
+            style: "margin-left:16px;",
+            text: `${evt.new_detections.length} bundled detection(s) (${summary}): ${ruleNames}`,
+          })
+        );
+
+        if (!alertedEvidenceIds.has(evt.evidence_id)) {
+          alertedEvidenceIds.add(evt.evidence_id);
+          toast(`${evt.evidence_id}: ${evt.new_detections.length} detection(s) - ${summary}`, true);
+        }
+      }
+    }
+  }
+
+  async function poll() {
+    try {
+      const snap = await apiGet(`/cases/${c.case_id}/capture/status`);
+      renderStatus(snap);
+      renderFeed(snap.recent_events);
+    } catch (e) {
+      toast("Capture status error: " + e.message, true);
+    }
+  }
+
+  startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true;
+    try {
+      await apiPost(`/cases/${c.case_id}/capture/start`, {
+        interface: interfaceSelect.value || undefined,
+        filter: filterInput.value.trim() || undefined,
+        rotate_seconds: parseInt(rotateInput.value, 10) || 30,
+      });
+      toast("Capture started.");
+      await poll();
+    } catch (e) {
+      toast("Could not start capture: " + e.message, true);
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    try {
+      await apiPost(`/cases/${c.case_id}/capture/stop`);
+      toast("Capture stopped.");
+      await poll();
+    } catch (e) {
+      toast("Could not stop capture: " + e.message, true);
+    }
+  });
+
+  await poll();
+  stopCapturePolling();
+  _capturePollTimer = setInterval(poll, 1500);
+}
+
+// --- Search (content search over a capture's raw bytes) ---
+//
+// The event pipeline keeps no payload, so this asks the capture file
+// directly through POST /search. Every hit names a frame and a stream,
+// which is what makes a result a starting point rather than a dead end.
+
+function pivotBar(c, hit) {
+  const bar = el("span", { class: "pivot" });
+  if (hit.stream !== null && hit.stream !== undefined) {
+    bar.appendChild(
+      el("a", {
+        href: `#/case/${c.case_id}/streams/${hit.stream}`,
+        text: `stream ${hit.stream}`,
+      })
+    );
+    bar.appendChild(el("span", { class: "sep", text: "|" }));
+  }
+  const filter = `frame.number == ${hit.frame_number}`;
+  bar.appendChild(
+    el("button", {
+      type: "button",
+      class: "cell-button dim",
+      text: "copy filter",
+      title: filter,
+      onclick: () => {
+        navigator.clipboard?.writeText(filter);
+        toast(`Copied: ${filter}`);
+      },
+    })
+  );
+  return bar;
+}
+
+async function renderSearch(app, c) {
+  app.appendChild(el("h1", { text: "Search" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Match raw packet bytes across this case's captures. Parsing keeps no payload, so this reads the capture file directly.",
+    })
+  );
+
+  const bar = el("div", { class: "filter-bar" });
+  const term = el("input", { placeholder: "flag{ , password=, 4d5a9000 …", style: "min-width:260px" });
+  const mode = el("select", {});
+  for (const m of ["text", "regex", "hex"]) mode.appendChild(el("option", { value: m, text: m }));
+  const dfilter = el("input", { placeholder: "display filter (optional)", class: "mono", style: "min-width:240px" });
+  const go = el("button", { text: "Search" });
+  bar.appendChild(term);
+  bar.appendChild(mode);
+  bar.appendChild(dfilter);
+  bar.appendChild(go);
+  app.appendChild(bar);
+
+  const out = el("div");
+  app.appendChild(out);
+
+  async function run() {
+    const pattern = term.value.trim();
+    if (!pattern) return;
+    out.innerHTML = "";
+    out.appendChild(el("div", { class: "loading", text: "Searching the capture…" }));
+    go.disabled = true;
+    try {
+      const res = await apiPost(`/cases/${c.case_id}/search`, {
+        pattern,
+        mode: mode.value,
+        display_filter: dfilter.value.trim() || undefined,
+      });
+      out.innerHTML = "";
+      out.appendChild(
+        el("div", { class: "result-head" }, [
+          el("h3", { text: `${res.hits.length} hit${res.hits.length === 1 ? "" : "s"}` }),
+          el("span", { class: "mono dim", text: res.display_filter }),
+        ])
+      );
+      if (!res.hits.length) {
+        out.appendChild(el("div", { class: "empty", text: "No packet in this capture contains that." }));
+        return;
+      }
+      const panel = el("div", { class: "panel" });
+      const table = el("table");
+      table.innerHTML =
+        "<thead><tr><th>Frame</th><th>Proto</th><th>Flow</th><th>Match in context</th><th>Pivot</th></tr></thead>";
+      const tbody = el("tbody");
+      for (const h of res.hits) {
+        const excerpt = el("td", { class: "mono" });
+        // Highlight the matched run without innerHTML: the excerpt is
+        // evidence bytes, and evidence must never be parsed as markup.
+        const text = h.excerpt || "";
+        const at = h.matched ? text.indexOf(h.matched) : -1;
+        if (at >= 0) {
+          excerpt.appendChild(document.createTextNode(text.slice(0, at)));
+          excerpt.appendChild(el("span", { class: "hit", text: h.matched }));
+          excerpt.appendChild(document.createTextNode(text.slice(at + h.matched.length)));
+        } else {
+          excerpt.textContent = text;
+        }
+        const row = el("tr", {}, [
+          el("td", { class: "mono dim", text: h.frame_number }),
+          el("td", {}, [el("span", { class: "badge badge-investigating", text: h.protocol || "?" })]),
+          el("td", { class: "mono dim", text: `${h.src || "?"} → ${h.dst || "?"}` }),
+          excerpt,
+          el("td", {}, [pivotBar(c, h)]),
+        ]);
+        tbody.appendChild(row);
+      }
+      table.appendChild(tbody);
+      panel.appendChild(table);
+      out.appendChild(panel);
+      if (res.truncated) {
+        out.appendChild(el("div", { class: "dim", text: "Stopped at the hit limit - there may be more." }));
+      }
+    } catch (e) {
+      out.innerHTML = "";
+      out.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+    } finally {
+      go.disabled = false;
+    }
+  }
+
+  go.onclick = run;
+  term.onkeydown = (ev) => {
+    if (ev.key === "Enter") run();
+  };
+}
+
+// --- Streams ---
+
+// --- Plain-language helpers ------------------------------------------------
+//
+// The glossary (core/explain.py via /api/glossary) is fetched once and used to
+// explain Wireshark's vocabulary wherever it appears. A term is a native
+// <details> element: keyboard-operable and announced correctly with no script.
+
+let _glossary = null;
+
+async function glossary() {
+  if (_glossary === null) {
+    try {
+      _glossary = await apiGet("/glossary");
+    } catch (e) {
+      _glossary = { protocols: {}, event_types: {} };
+    }
+  }
+  return _glossary;
+}
+
+function protocolKey(name) {
+  const n = String(name || "").trim().toLowerCase().split("/")[0];
+  if (_glossary && _glossary.protocols[n]) return n;
+  const stripped = n.replace(/v?\d+(\.\d+)*$/, "").replace(/v$/, "");
+  return _glossary && _glossary.protocols[stripped] ? stripped : n;
+}
+
+// A protocol name that opens to a one-line explanation; plain text when the
+// glossary does not know it.
+function termEl(name) {
+  const entry = _glossary && _glossary.protocols[protocolKey(name)];
+  if (!entry) return el("span", { class: "term-plain", text: name });
+  // Say whether it is encrypted - unless the description already does.
+  const saysIt = /encrypt/i.test(entry.what);
+  const lock = saysIt ? "" : entry.encrypted === true ? "Encrypted. " : entry.encrypted === false ? "Not encrypted. " : "";
+  return el("details", { class: "term" }, [
+    el("summary", { text: name, title: `What is ${entry.name}?` }),
+    el("span", { class: "term-what", text: `${lock}${entry.what}` }),
+  ]);
+}
+
+function eventLabel(type) {
+  if (_glossary && _glossary.event_types[type]) return _glossary.event_types[type];
+  if (String(type).startsWith("windows_event:")) return `Windows event (${type.split(":")[1]})`;
+  const t = String(type || "event").replace(/_/g, " ");
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+async function renderStreams(app, c, focus) {
+  app.appendChild(el("h1", { text: "Conversations" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Each row is one conversation between two computers, put back together from its packets. Start with the plain description; the Wireshark details are underneath for when you need them.",
+    })
+  );
+  await glossary();
+
+  const layout = el("div", { class: "two-col reverse" });
+  const list = el("div", { class: "panel" });
+  const reader = el("div", { class: "panel", "aria-live": "polite" });
+  layout.appendChild(list);
+  layout.appendChild(reader);
+  app.appendChild(layout);
+
+  reader.appendChild(el("div", { class: "empty", text: "Choose a conversation to read it." }));
+
+  const byStream = new Map();
+
+  async function follow(index) {
+    reader.innerHTML = "";
+    reader.appendChild(el("div", { class: "loading", text: "Putting the conversation back together…" }));
+    history.replaceState(null, "", `#/case/${c.case_id}/streams/${index}`);
+    try {
+      const s = await apiGet(`/cases/${c.case_id}/streams/${index}`);
+      const summary = byStream.get(Number(index));
+      reader.innerHTML = "";
+      reader.appendChild(el("h2", { class: "stream-title", text: summary ? summary.plain.headline : `Conversation ${s.stream}` }));
+      if (summary) {
+        const ul = el("ul", { class: "plain-points" });
+        for (const p of summary.plain.points) ul.appendChild(el("li", { text: p }));
+        reader.appendChild(ul);
+      }
+      for (const h of s.hints || []) reader.appendChild(el("div", { class: "file-note", text: h }));
+
+      const actions = el("div", { class: "filter-bar" });
+      const explain = el("button", { type: "button", class: "secondary", text: "Explain this conversation with AI" });
+      actions.appendChild(explain);
+      const dataUrl = (dir) => `${API}/cases/${c.case_id}/streams/${s.stream}/data?direction=${dir}`;
+      actions.appendChild(el("a", { class: "button-link secondary", href: dataUrl("a"), download: "", text: `Save what ${s.node_a} sent` }));
+      actions.appendChild(el("a", { class: "button-link secondary", href: dataUrl("b"), download: "", text: `Save what ${s.node_b} sent` }));
+      reader.appendChild(actions);
+      const aiBox = el("div", { class: "ai-explain" });
+      reader.appendChild(aiBox);
+      explain.addEventListener("click", async () => {
+        explain.disabled = true;
+        aiBox.innerHTML = "";
+        aiBox.appendChild(el("div", { class: "loading", text: "Asking the assistant to explain it…" }));
+        try {
+          const question =
+            `Explain TCP conversation (stream) ${s.stream} to someone new to network forensics. ` +
+            "Follow the stream, then say in plain language what the two computers did, what was sent, " +
+            "whether anything in it is sensitive or suspicious, and what to check next.";
+          const r = await apiPost(`/cases/${c.case_id}/chat`, { question });
+          aiBox.innerHTML = "";
+          aiBox.appendChild(el("div", { class: "answer", text: r.answer }));
+          const cites = el("div", { class: "cites" }, [el("span", { class: "dim", text: "Based on:" })]);
+          for (const cit of r.citations || []) cites.appendChild(el("span", { class: "cite", text: `${cit.kind} ${cit.reference}` }));
+          aiBox.appendChild(cites);
+          aiBox.appendChild(el("div", { class: "dim", text: "AI-written and checked against the evidence it cites. Recorded in the chain of custody." }));
+        } catch (e) {
+          aiBox.innerHTML = "";
+          const refused = /refused/i.test(e.message);
+          aiBox.appendChild(
+            el("div", {
+              class: refused ? "refused" : "error-box",
+              text: refused
+                ? "The assistant's answer was refused because it cited something it had not actually retrieved. " + e.message
+                : `The assistant is not available: ${e.message} Set up an AI provider (a local model or an API key) in Settings.`,
+            })
+          );
+        } finally {
+          explain.disabled = false;
+        }
+      });
+
+      const tech = el("details", { class: "tech" }, [el("summary", { text: "Wireshark details" })]);
+      tech.appendChild(el("div", { class: "mono dim", text: `TCP stream ${s.stream} · ${s.node_a} ↔ ${s.node_b}` }));
+      if (summary) tech.appendChild(el("div", { class: "mono dim", text: `${summary.packets} packets · ${summary.bytes} bytes · ${(summary.applications || []).join(", ")}` }));
+      tech.appendChild(el("div", { class: "mono dim", text: `Wireshark filter: tcp.stream eq ${s.stream}` }));
+      reader.appendChild(tech);
+
+      reader.appendChild(el("h3", { text: "What was said" }));
+      reader.appendChild(
+        el("div", { class: "dim", text: "Each block is one side talking. Unreadable bytes show as dots; save the data above to get it exactly." })
+      );
+      for (const turn of s.turns) {
+        const fromA = turn.sender === "a";
+        const box = el("div", { class: "turn " + (fromA ? "turn-a" : "turn-b") });
+        box.appendChild(el("div", { class: "turn-head", text: `${fromA ? s.node_a : s.node_b} said (${fmtBytes(turn.byte_count)})` }));
+        box.appendChild(el("pre", { text: turn.text }));
+        reader.appendChild(box);
+      }
+      if (s.truncated) reader.appendChild(el("div", { class: "dim", text: "Only the start is shown - save the data to see all of it." }));
+    } catch (e) {
+      reader.innerHTML = "";
+      reader.appendChild(el("div", { class: "error-box", text: "Could not read this conversation: " + e.message }));
+    }
+  }
+
+  list.appendChild(el("div", { class: "loading", text: "Finding conversations…" }));
+  try {
+    const res = await apiGet(`/cases/${c.case_id}/streams`);
+    list.innerHTML = "";
+    if (!res.streams.length) {
+      list.appendChild(el("div", { class: "empty", text: "No TCP conversations in this capture." }));
+      return;
+    }
+    list.appendChild(el("div", { class: "dim", text: `${res.streams.length} largest conversations, biggest first` }));
+    const items = el("div", { class: "stream-list", role: "list" });
+    for (const s of res.streams) {
+      byStream.set(Number(s.stream), s);
+      const wrap = el("div", { role: "listitem" });
+      const item = el("button", { type: "button", class: "stream-item" });
+      item.appendChild(el("div", { class: "stream-plain", text: s.plain.headline }));
+      const lock =
+        s.plain.encrypted === true
+          ? el("span", { class: "badge badge-low", text: "Encrypted" })
+          : s.plain.encrypted === false
+            ? el("span", { class: "badge badge-medium", text: "Readable" })
+            : null;
+      const meta = el("div", { class: "stream-meta" });
+      if (lock) meta.appendChild(lock);
+      meta.appendChild(el("span", { class: "mono dim", text: `stream ${s.stream} · ${s.packets} packets` }));
+      item.appendChild(meta);
+      item.addEventListener("click", () => follow(s.stream));
+      wrap.appendChild(item);
+      const terms = el("div", { class: "stream-terms" });
+      for (const p of (s.applications || []).filter((p, i, all) => all.indexOf(p) === i)) terms.appendChild(termEl(p));
+      wrap.appendChild(terms);
+      items.appendChild(wrap);
+    }
+    list.appendChild(items);
+    if (focus !== undefined && focus !== null && focus !== "") follow(focus);
+  } catch (e) {
+    list.innerHTML = "";
+    list.appendChild(el("div", { class: "error-box", text: "Could not list conversations: " + e.message }));
+  }
+}
+
+async function renderTriage(app, c) {
+  await glossary();
+  app.appendChild(el("h1", { text: "Triage" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "The first questions worth asking an unfamiliar capture. Read-only - nothing here becomes a finding until you say so.",
+    })
+  );
+
+  const out = el("div");
+  app.appendChild(out);
+  out.appendChild(el("div", { class: "loading", text: "Running triage…" }));
+
+  try {
+    const r = await apiGet(`/cases/${c.case_id}/triage`);
+    out.innerHTML = "";
+
+    const cols = el("div", { class: "two-col reverse" });
+
+    // protocols
+    const protoPanel = el("div", { class: "panel" });
+    protoPanel.appendChild(el("h3", { text: "Protocols" }));
+    for (const p of r.protocols) {
+      const row = el("div", { class: "proto-row", style: `padding-left:${p.depth * 14}px` });
+      row.appendChild(termEl(p.protocol));
+      if (p.note) row.appendChild(el("span", { class: "badge badge-medium", text: "readable" }));
+      row.appendChild(el("span", { class: "dim right", text: p.frames }));
+      protoPanel.appendChild(row);
+      if (p.note) protoPanel.appendChild(el("div", { class: "proto-note", style: `padding-left:${p.depth * 14}px`, text: p.note }));
+    }
+
+    const filePanel = el("div", { class: "panel" });
+    filePanel.appendChild(el("h3", { text: "Recoverable files" }));
+    if (!r.files.length) filePanel.appendChild(el("div", { class: "empty", text: "None recovered." }));
+    for (const f of r.files) {
+      filePanel.appendChild(
+        el("div", { class: "file-row" }, [
+          el("div", { text: f.name }),
+          el("div", { class: "mono dim", text: `${f.protocol} · ${f.size} B · ${f.sha256.slice(0, 12)}…` }),
+        ])
+      );
+    }
+    if (r.files.length) {
+      filePanel.appendChild(
+        el("div", { class: "dim" }, [
+          document.createTextNode("Analyzed evidence keeps these files. "),
+          el("a", { href: `#/case/${c.case_id}/files`, text: "Open, preview and download them under Recovered files" }),
+        ])
+      );
+    }
+
+    const left = el("div");
+    left.appendChild(protoPanel);
+    left.appendChild(filePanel);
+
+    // candidates
+    const candPanel = el("div", { class: "panel" });
+    candPanel.appendChild(
+      el("div", { class: "result-head" }, [
+        el("h3", { text: `Candidates (${r.candidates.length})` }),
+        el("span", { class: "dim", text: "strings that matched a pattern - leads to judge, not verdicts" }),
+      ])
+    );
+    if (!r.candidates.length) {
+      candPanel.appendChild(el("div", { class: "empty", text: "Nothing matched." }));
+    }
+    for (const cat of ["flags", "credentials", "secrets"]) {
+      const rows = r.candidates.filter((x) => x.category === cat);
+      if (!rows.length) continue;
+      candPanel.appendChild(el("h3", { text: cat }));
+      const table = el("table");
+      const tbody = el("tbody");
+      for (const x of rows) {
+        tbody.appendChild(
+          el("tr", {}, [
+            el("td", {}, [el("span", { class: "badge badge-low mono", text: x.pattern })]),
+            el("td", { class: "mono hit-text", text: x.value }),
+            el("td", { class: "mono dim", text: `frame ${x.frame_number}` }),
+            el("td", {}, [pivotBar(c, x)]),
+          ])
+        );
+      }
+      table.appendChild(tbody);
+      candPanel.appendChild(table);
+    }
+
+    cols.appendChild(candPanel);
+    cols.appendChild(left);
+    out.appendChild(cols);
+  } catch (e) {
+    out.innerHTML = "";
+    out.appendChild(el("div", { class: "error-box", text: "Error: " + e.message }));
+  }
+}
+
+// --- Assistant ---
+
+async function renderChat(app, c) {
+  app.appendChild(el("h1", { text: "Assistant" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Ask about this case. The assistant retrieves evidence itself, and every claim is checked against what it retrieved - an answer citing anything else is refused rather than shown.",
+    })
+  );
+
+  const log = el("div", { class: "chat-log" });
+  app.appendChild(log);
+
+  const bar = el("div", { class: "filter-bar" });
+  const q = el("input", { placeholder: "Was anything downloaded from an external host?", style: "flex-grow:1;min-width:320px" });
+  const send = el("button", { text: "Ask" });
+  bar.appendChild(q);
+  bar.appendChild(send);
+  app.appendChild(bar);
+
+  async function ask() {
+    const question = q.value.trim();
+    if (!question) return;
+    q.value = "";
+    log.appendChild(el("div", { class: "bubble-me", text: question }));
+
+    const pending = el("div", { class: "loading", text: "Retrieving evidence…" });
+    log.appendChild(pending);
+    send.disabled = true;
+    try {
+      const r = await apiPost(`/cases/${c.case_id}/chat`, { question });
+      pending.remove();
+
+      if (r.steps && r.steps.length) {
+        const steps = el("div", { class: "panel steps" });
+        steps.appendChild(el("h3", { text: "Retrieved" }));
+        for (const s of r.steps) {
+          steps.appendChild(
+            el("div", { class: "step" }, [
+              el("span", { class: "mono", text: s.tool }),
+              el("span", { class: "dim right", text: s.error || s.summary }),
+            ])
+          );
+        }
+        log.appendChild(steps);
+      }
+
+      log.appendChild(el("div", { class: "answer", text: r.answer }));
+      if (!r.evidence_sufficient) {
+        log.appendChild(el("div", { class: "badge badge-medium", text: "evidence judged insufficient" }));
+      }
+      if (r.citations && r.citations.length) {
+        const cites = el("div", { class: "cites" });
+        cites.appendChild(el("span", { class: "dim", text: "Cited evidence:" }));
+        for (const cit of r.citations) {
+          const label = `${cit.kind} ${cit.reference}`;
+          if (cit.kind === "stream") {
+            cites.appendChild(el("a", { class: "cite", href: `#/case/${c.case_id}/streams/${cit.reference}`, text: label }));
+          } else {
+            cites.appendChild(el("span", { class: "cite", text: label }));
+          }
+        }
+        log.appendChild(cites);
+      }
+    } catch (e) {
+      pending.remove();
+      // A refusal is not a crash - it is the contract working. Say so.
+      const refused = /refused/i.test(e.message);
+      log.appendChild(
+        el("div", { class: refused ? "refused" : "error-box", text: (refused ? "Answer refused. " : "Error: ") + e.message })
+      );
+    } finally {
+      send.disabled = false;
+      log.scrollTop = log.scrollHeight;
+    }
+  }
+
+  send.onclick = ask;
+  q.onkeydown = (ev) => {
+    if (ev.key === "Enter") ask();
+  };
+}
+
+// --- Investigation team ------------------------------------------------
+//
+// Runs the specialist analysts (agents/) over the case and shows their
+// merged, cited findings, each of which the investigator can accept as an
+// Open finding. A run takes minutes, so it happens server-side on a thread
+// (web/team_runs.py) and this view polls, as the capture view does.
+//
+// Everything a model wrote - titles, assessments, notes - is rendered with
+// textContent via el({text}), never as HTML: it is untrusted output.
+
+let _teamPollTimer = null;
+
+function stopTeamPolling() {
+  if (_teamPollTimer) {
+    clearInterval(_teamPollTimer);
+    _teamPollTimer = null;
+  }
+}
+
+function teamSeverityBadge(severity) {
+  const s = String(severity || "").toLowerCase();
+  return el("span", { class: "badge badge-" + (s === "info" ? "none" : cssClass(s)), text: severity || "?" });
+}
+
+async function renderTeam(app, c) {
+  app.appendChild(el("h1", { text: "Investigation team" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Specialist AI analysts investigate the case with read-only tools. Findings that rest on the same evidence are merged, and any finding that cites something its analyst did not actually retrieve is dropped. Nothing is written to the case until you accept a finding.",
+    })
+  );
+
+  const controls = el("div", { class: "panel team-controls" });
+  const progress = el("div", { class: "team-progress", "aria-live": "polite" });
+  const results = el("div", { class: "team-results" });
+  app.appendChild(controls);
+  app.appendChild(progress);
+  app.appendChild(results);
+
+  let status;
+  try {
+    status = await apiGet(`/cases/${c.case_id}/team`);
+  } catch (e) {
+    controls.appendChild(el("div", { class: "error-box", text: "Could not load the team: " + e.message }));
+    return;
+  }
+
+  let providerInfo = { providers: ["anthropic", "openai", "ollama", "gemini"] };
+  try {
+    providerInfo = await apiGet("/ai-providers");
+  } catch (e) {
+    /* the fallback list above is fine */
+  }
+
+  // --- controls ---
+  const roleBoxes = [];
+  const roleRow = el("div", { class: "team-roles" });
+  roleRow.appendChild(el("span", { class: "dim", text: "Analysts:" }));
+  for (const role of status.available_roles || []) {
+    const box = el("input", { type: "checkbox", id: `team-role-${role.slug}`, value: role.slug });
+    box.checked = true;
+    roleBoxes.push(box);
+    roleRow.appendChild(el("label", { class: "team-role", for: `team-role-${role.slug}` }, [box, document.createTextNode(" " + role.name)]));
+  }
+  controls.appendChild(roleRow);
+
+  const bar = el("div", { class: "filter-bar" });
+  const providerSelect = selectEl(providerInfo.providers, status.provider);
+  providerSelect.setAttribute("aria-label", "AI provider");
+  const steps = el("input", { type: "number", min: "1", max: "20", value: "6", style: "width:90px", placeholder: "Steps per analyst" });
+  const runBtn = el("button", { text: "Run the team" });
+  bar.appendChild(el("label", { class: "dim", text: "Provider" }));
+  bar.appendChild(providerSelect);
+  bar.appendChild(el("label", { class: "dim", text: "Tool calls per analyst" }));
+  bar.appendChild(steps);
+  bar.appendChild(runBtn);
+  controls.appendChild(bar);
+
+  const privacy = el("div", { class: "dim" });
+  function updatePrivacy() {
+    privacy.textContent =
+      providerSelect.value === "ollama"
+        ? "Ollama runs locally: case content stays on this machine."
+        : `Case content the analysts retrieve is sent to ${providerSelect.value}. The run is recorded in the chain of custody. Choose Ollama to keep it local.`;
+  }
+  providerSelect.addEventListener("change", updatePrivacy);
+  updatePrivacy();
+  controls.appendChild(privacy);
+
+  // --- progress ---
+  function renderProgress(run) {
+    progress.innerHTML = "";
+    if (!run || run.state !== "running") return;
+    const panel = el("div", { class: "panel" });
+    panel.appendChild(el("div", { class: "loading", text: `The team is investigating with ${run.provider}…` }));
+    const list = el("div", { class: "team-role-states" });
+    for (const name of run.roles) {
+      const done = run.completed_roles.includes(name);
+      const active = run.current_role === name;
+      list.appendChild(
+        el("div", { class: "team-role-state" + (active ? " active" : done ? " done" : "") }, [
+          el("span", { class: "mono", text: done ? "done" : active ? "working" : "queued" }),
+          el("span", { text: name }),
+        ])
+      );
+    }
+    panel.appendChild(list);
+    panel.appendChild(el("div", { class: "dim", text: "You can leave this page; the run continues and its result will be here." }));
+    progress.appendChild(panel);
+  }
+
+  // --- results ---
+  function citationChip(cit) {
+    const label = `${cit.kind} ${cit.reference}`;
+    if (cit.kind === "stream") {
+      return el("a", { class: "cite", href: `#/case/${c.case_id}/streams/${encodeURIComponent(cit.reference)}`, text: label });
+    }
+    return el("span", { class: "cite", text: label, title: cit.evidence_id });
+  }
+
+  function renderResults(latest) {
+    results.innerHTML = "";
+    if (!latest) {
+      results.appendChild(el("div", { class: "empty", text: "The team has not investigated this case yet." }));
+      return;
+    }
+    const when = String(latest.finished_at || "").replace("T", " ").slice(0, 19);
+    results.appendChild(el("h2", { text: "Latest run" }));
+    results.appendChild(el("div", { class: "dim", text: `${when} UTC - ${latest.provider}${latest.model ? " / " + latest.model : ""}` }));
+
+    if (latest.error) {
+      results.appendChild(el("div", { class: "error-box", text: "The run did not complete: " + latest.error }));
+    }
+
+    const roles = el("div", { class: "panel team-role-results" });
+    for (const r of latest.role_results || []) {
+      const summary = r.note && !(r.findings || []).length ? r.note : `${(r.findings || []).length} finding(s), ${(r.tool_calls || []).length} tool call(s)${r.note ? " - " + r.note : ""}`;
+      roles.appendChild(el("div", { class: "step" }, [el("span", { text: r.role }), el("span", { class: "dim right", text: summary })]));
+    }
+    results.appendChild(roles);
+
+    const findings = latest.findings || [];
+    if (!findings.length) {
+      if (!latest.error) results.appendChild(el("div", { class: "empty", text: "No cited findings. The team found nothing it could support with evidence." }));
+      return;
+    }
+    results.appendChild(el("h2", { text: `Findings (${findings.length}), most severe first` }));
+    const accepted = latest.accepted || {};
+    findings.forEach((f, index) => {
+      const card = el("div", { class: "panel team-finding" });
+      const head = el("div", { class: "team-finding-head" }, [
+        teamSeverityBadge(f.severity),
+        el("b", { text: f.title }),
+        el("span", { class: "dim", text: `confidence ${f.confidence} - ${(f.reported_by || []).join(", ")}` }),
+      ]);
+      card.appendChild(head);
+      card.appendChild(el("div", { class: "team-assessment", text: f.assessment }));
+      const cites = el("div", { class: "cites" }, [el("span", { class: "dim", text: "Evidence:" })]);
+      for (const cit of f.citations || []) cites.appendChild(citationChip(cit));
+      card.appendChild(cites);
+
+      const actions = el("div", { class: "filter-bar" });
+      if (accepted[String(index)]) {
+        actions.appendChild(el("a", { href: `#/case/${c.case_id}/findings`, text: `Accepted as ${accepted[String(index)]} →` }));
+      } else {
+        const accept = el("button", { class: "secondary", text: "Accept as finding" });
+        accept.addEventListener("click", async () => {
+          accept.disabled = true;
+          try {
+            const saved = await apiPost(`/cases/${c.case_id}/team/findings/${index}/accept`, {});
+            toast(`Recorded as ${saved.finding_id} (Open) - confirm or reject it under Findings.`);
+            accepted[String(index)] = saved.finding_id;
+            actions.innerHTML = "";
+            actions.appendChild(el("a", { href: `#/case/${c.case_id}/findings`, text: `Accepted as ${saved.finding_id} →` }));
+          } catch (e) {
+            toast("Could not accept: " + e.message, true);
+            accept.disabled = false;
+          }
+        });
+        actions.appendChild(accept);
+        actions.appendChild(el("span", { class: "dim", text: "Saved as Open for your review - never as Confirmed." }));
+      }
+      card.appendChild(actions);
+      results.appendChild(card);
+    });
+  }
+
+  function applyStatus(s) {
+    const running = s.run && s.run.state === "running";
+    runBtn.disabled = running;
+    runBtn.textContent = running ? "Running…" : "Run the team";
+    renderProgress(s.run);
+    if (!running) renderResults(s.latest);
+    return running;
+  }
+
+  function startPolling() {
+    stopTeamPolling();
+    _teamPollTimer = setInterval(async () => {
+      try {
+        const s = await apiGet(`/cases/${c.case_id}/team`);
+        if (!applyStatus(s)) {
+          stopTeamPolling();
+          if (s.run && s.run.state === "failed") toast("The team run failed: " + (s.run.error || "unknown error"), true);
+          else toast("The investigation team has finished.");
+        }
+      } catch (e) {
+        stopTeamPolling();
+        toast("Lost track of the team run: " + e.message, true);
+      }
+    }, 2000);
+  }
+
+  runBtn.addEventListener("click", async () => {
+    const roles = roleBoxes.filter((b) => b.checked).map((b) => b.value);
+    if (!roles.length) {
+      toast("Choose at least one analyst.", true);
+      return;
+    }
+    runBtn.disabled = true;
+    try {
+      const body = { provider: providerSelect.value, max_steps: Number(steps.value) || 6 };
+      // Only name roles when the investigator narrowed the set; otherwise the
+      // server skips analysts with no evidence to read, like the CLI does.
+      if (roles.length !== roleBoxes.length) body.roles = roles;
+      const run = await apiPost(`/cases/${c.case_id}/team`, body);
+      applyStatus({ run, latest: null });
+      startPolling();
+    } catch (e) {
+      toast("Could not start the team: " + e.message, true);
+      runBtn.disabled = false;
+    }
+  });
+
+  if (applyStatus(status)) startPolling();
+}
+
+// --- Recovered files -----------------------------------------------------
+//
+// Files the analysis pulled out of network traffic (HTTP, SMB shares, FTP,
+// TFTP, email). The point of this view is that someone new can see what
+// each file really is, where it came from, and look inside it - safely.
+// Nothing from a file is rendered as HTML or run: previews are text, a
+// table, a raster image the server has verified, or a hex dump (see
+// core/artifacts.py). Everything a file contains is shown via textContent.
+
+const RISK_LABEL = { high: "Could run code", medium: "Handle with care", low: "Low risk" };
+const RISK_BADGE = { high: "high", medium: "medium", low: "low" };
+
+// Sizes use the shared fmtBytes() near the top of this file; a second
+// definition here once silently replaced it for the whole page.
+
+function fmtUtc(iso) {
+  if (!iso) return "unknown time";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }).format(d) + " UTC";
+}
+
+function fileJourney(f) {
+  const proto = (f.protocol || "").toUpperCase().replace("FTP-DATA", "FTP");
+  const src = f.source || {};
+  if (src.from && src.to) return `Sent from ${src.from} to ${src.to} over ${proto}`;
+  return `Recovered from ${proto} traffic`;
+}
+
+function fileUrl(c, f, extra) {
+  const q = new URLSearchParams({ path: f.path, ...(extra || {}) });
+  return `${API}/cases/${c.case_id}/artifacts/content?${q}`;
+}
+
+async function renderFiles(app, c, focusPath) {
+  app.appendChild(el("h1", { text: "Recovered files" }));
+  app.appendChild(
+    el("div", {
+      class: "subtitle",
+      text:
+        "Files pulled out of this case's network traffic. Look inside them here safely - nothing is opened or run. Download a copy only when you need one, and open programs only on an isolated analysis machine.",
+    })
+  );
+
+  const layout = el("div", { class: "files-layout" });
+  const list = el("div", { class: "files-list", role: "list" });
+  const detail = el("div", { class: "panel files-detail", "aria-live": "polite" });
+  layout.appendChild(list);
+  layout.appendChild(detail);
+  app.appendChild(layout);
+
+  list.appendChild(el("div", { class: "loading", text: "Loading recovered files…" }));
+  let rows;
+  try {
+    rows = await apiGet(`/cases/${c.case_id}/artifacts`);
+  } catch (e) {
+    list.innerHTML = "";
+    list.appendChild(el("div", { class: "error-box", text: "Could not load recovered files: " + e.message }));
+    return;
+  }
+  list.innerHTML = "";
+
+  if (!rows.length) {
+    layout.remove();
+    const tshark = await wiresharkStatus();
+    app.appendChild(
+      el("div", { class: "panel empty-state" }, [
+        el("h2", { text: "No files were recovered from this case" }),
+        el("p", {
+          text:
+            "Files are recovered from web downloads and uploads (HTTP), Windows file shares (SMB), FTP, TFTP and email. None of those carried a file in this evidence, or it has not been analyzed yet.",
+        }),
+        tshark && !tshark.available
+          ? el("p", { text: "Install Wireshark to recover files from SMB, FTP, TFTP and email - without it only HTTP files are recovered." })
+          : el("span"),
+        el("a", { class: "button-link", href: `#/case/${c.case_id}/evidence`, text: "Go to Evidence" }),
+      ])
+    );
+    return;
+  }
+
+  const order = { high: 0, medium: 1, low: 2 };
+  rows.sort((a, b) => (order[a.risk] ?? 3) - (order[b.risk] ?? 3) || a.name.localeCompare(b.name));
+
+  let selected = null;
+  function select(f, item) {
+    if (selected) selected.classList.remove("active");
+    selected = item;
+    item.classList.add("active");
+    history.replaceState(null, "", `#/case/${c.case_id}/files/${encodeURIComponent(f.path)}`);
+    showDetail(f);
+  }
+
+  // A real capture can yield thousands of files (one test case had 12,327),
+  // so the list is filtered and drawn a page at a time rather than all at once.
+  const PAGE = 200;
+  const tools = el("div", { class: "files-tools" });
+  const search = el("input", { type: "search", placeholder: "Filter by name…", autocomplete: "off", spellcheck: "false" });
+  const riskFilter = el("select", { "aria-label": "Filter by risk" }, [
+    el("option", { value: "", text: "Any risk" }),
+    el("option", { value: "high", text: RISK_LABEL.high }),
+    el("option", { value: "medium", text: RISK_LABEL.medium }),
+    el("option", { value: "low", text: RISK_LABEL.low }),
+  ]);
+  const count = el("div", { class: "dim", "aria-live": "polite" });
+  tools.appendChild(search);
+  tools.appendChild(riskFilter);
+  // Toolbar, count and list share the left grid column.
+  const column = el("div", { class: "files-column" });
+  layout.insertBefore(column, list);
+  column.appendChild(tools);
+  column.appendChild(count);
+  column.appendChild(list);
+  const more = el("button", { type: "button", class: "secondary", text: "Show more" });
+
+  let visible = [];
+  let shown = 0;
+  function fileItem(f) {
+    const wrap = el("div", { role: "listitem" });
+    const item = el("button", { type: "button", class: "file-item" });
+    const top = el("div", { class: "file-item-top" }, [
+      el("span", { class: "file-name", text: f.name, title: f.name }),
+      f.missing ? el("span", { class: "badge badge-none", text: "Missing" }) : el("span", { class: "badge badge-" + RISK_BADGE[f.risk], text: RISK_LABEL[f.risk] }),
+    ]);
+    item.appendChild(top);
+    item.appendChild(el("div", { class: "dim", text: `${f.missing ? "File missing" : f.type.label} · ${fmtBytes(f.size_bytes)}` }));
+    item.appendChild(el("div", { class: "file-journey", text: fileJourney(f) }));
+    for (const note of f.notes || []) item.appendChild(el("div", { class: "file-note", text: note }));
+    item.addEventListener("click", () => select(f, item));
+    wrap.appendChild(item);
+    return { wrap, item };
+  }
+  function drawMore() {
+    more.remove();
+    for (const f of visible.slice(shown, shown + PAGE)) list.appendChild(fileItem(f).wrap);
+    shown = Math.min(shown + PAGE, visible.length);
+    if (shown < visible.length) {
+      more.textContent = `Show ${Math.min(PAGE, visible.length - shown)} more (${visible.length - shown} not shown)`;
+      list.appendChild(more);
+    }
+  }
+  function applyFilter() {
+    const q = search.value.trim().toLowerCase();
+    const risk = riskFilter.value;
+    visible = rows.filter((f) => (!q || f.name.toLowerCase().includes(q)) && (!risk || f.risk === risk));
+    list.innerHTML = "";
+    shown = 0;
+    count.textContent = visible.length === rows.length ? `${rows.length} file${rows.length === 1 ? "" : "s"}` : `${visible.length} of ${rows.length} files`;
+    if (!visible.length) list.appendChild(el("div", { class: "empty", text: "No recovered file matches that filter." }));
+    else drawMore();
+  }
+  more.addEventListener("click", drawMore);
+  search.addEventListener("input", applyFilter);
+  riskFilter.addEventListener("change", applyFilter);
+  applyFilter();
+
+  // A deep link can name a file beyond the first page; show it regardless.
+  const focused = focusPath ? rows.find((f) => f.path === focusPath) : null;
+  if (focused) {
+    const onPage = [...list.querySelectorAll(".file-item")][visible.indexOf(focused)];
+    if (onPage) select(focused, onPage);
+    else select(focused, fileItem(focused).item);
+  } else {
+    select(rows[0], list.querySelector(".file-item"));
+  }
+
+  function showDetail(f) {
+    detail.innerHTML = "";
+    detail.appendChild(el("h2", { class: "file-title", text: f.name }));
+    detail.appendChild(el("div", { class: "file-journey", text: fileJourney(f) }));
+
+    if (f.missing) {
+      detail.appendChild(el("div", { class: "error-box", text: "This file was recovered but is no longer in the case folder, so it cannot be shown or downloaded." }));
+      return;
+    }
+
+    if (f.risk_reasons && f.risk_reasons.length) {
+      const warn = el("div", { class: "risk-box risk-" + f.risk });
+      warn.appendChild(el("b", { text: RISK_LABEL[f.risk] }));
+      const ul = el("ul");
+      for (const r of f.risk_reasons) ul.appendChild(el("li", { text: r }));
+      warn.appendChild(ul);
+      detail.appendChild(warn);
+    }
+
+    const facts = el("dl", { class: "facts" });
+    const add = (k, v) => {
+      if (v == null || v === "") return;
+      facts.appendChild(el("dt", { text: k }));
+      facts.appendChild(typeof v === "string" ? el("dd", { text: v }) : el("dd", {}, [v]));
+    };
+    add("What it really is", f.type.label);
+    add("Size", fmtBytes(f.size_bytes));
+    const hash = el("span", { class: "mono hash", text: f.sha256, translate: "no" });
+    const copy = el("button", { type: "button", class: "secondary small", text: "Copy SHA-256" });
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(f.sha256);
+        toast("SHA-256 copied.");
+      } catch (e) {
+        toast("Could not copy: " + e.message, true);
+      }
+    });
+    add("SHA-256", el("span", { class: "hash-row" }, [hash, copy]));
+    const src = f.source || {};
+    add(f.protocol === "imf" ? "Email subject" : "Original name", src.original_name || "");
+    add("Web address", src.url || "");
+    add("Seen", src.timestamp ? fmtUtc(src.timestamp) : "");
+    add("How it was recovered", src.recovered_by === "ftp-command-pairing"
+      ? "Rebuilt by TrustTrace from the FTP command and its data connection (Wireshark could not export it)"
+      : "Exported by Wireshark");
+    if (src.stream != null) {
+      add("Conversation", el("a", { href: `#/case/${c.case_id}/streams/${src.stream}`, text: `Open the conversation it travelled in` }));
+    }
+    detail.appendChild(facts);
+    for (const note of f.notes || []) detail.appendChild(el("div", { class: "file-note", text: note }));
+
+    const actions = el("div", { class: "filter-bar" });
+    const download = el("a", { class: "button-link", href: fileUrl(c, f), download: f.name, text: "Download a copy" });
+    if (f.risk === "high") {
+      download.addEventListener("click", (ev) => {
+        if (!download.dataset.confirmed) {
+          ev.preventDefault();
+          download.dataset.confirmed = "1";
+          download.textContent = "Download anyway";
+          toast("This file can run code if opened. Download it only to an isolated analysis machine - click again to download.", true);
+        }
+      });
+    }
+    actions.appendChild(download);
+    actions.appendChild(el("span", { class: "dim", text: "The download is recorded in the chain of custody." }));
+    detail.appendChild(actions);
+
+    const previewBox = el("div", { class: "file-preview" });
+    detail.appendChild(el("h3", { text: "Look inside" }));
+    detail.appendChild(previewBox);
+    loadPreview(f, previewBox);
+  }
+
+  async function loadPreview(f, box) {
+    box.appendChild(el("div", { class: "loading", text: "Reading the file…" }));
+    try {
+      const p = await apiGet(`/cases/${c.case_id}/artifacts/preview?${new URLSearchParams({ path: f.path })}`);
+      box.innerHTML = "";
+      if (p.mode === "empty") {
+        box.appendChild(el("div", { class: "empty", text: "This file is empty." }));
+      } else if (p.mode === "image") {
+        box.appendChild(el("img", { src: fileUrl(c, f, { inline: "1" }), alt: `Preview of ${f.name}`, class: "file-image", loading: "lazy" }));
+      } else if (p.mode === "table") {
+        const wrap = el("div", { class: "table-wrap" });
+        const t = el("table", { class: "mini" });
+        const head = el("tr", {}, p.header.map((h) => el("th", { text: h })));
+        t.appendChild(el("thead", {}, [head]));
+        const tb = el("tbody");
+        for (const r of p.rows) tb.appendChild(el("tr", {}, r.map((v) => el("td", { text: v }))));
+        t.appendChild(tb);
+        wrap.appendChild(t);
+        box.appendChild(wrap);
+        box.appendChild(el("div", { class: "dim", text: `${p.rows.length} row${p.rows.length === 1 ? "" : "s"} shown${p.truncated ? " - the file has more; download it to see everything." : "."}` }));
+      } else if (p.mode === "email") {
+        // Decoded for reading; still text only - an HTML body is shown as
+        // its source, never rendered.
+        const head = el("dl", { class: "facts email-head" });
+        const labels = { from: "From", to: "To", cc: "Cc", date: "Date", subject: "Subject" };
+        for (const key of ["from", "to", "cc", "date", "subject"]) {
+          if (!p.headers[key]) continue;
+          head.appendChild(el("dt", { text: labels[key] }));
+          head.appendChild(el("dd", { text: p.headers[key] }));
+        }
+        box.appendChild(head);
+        if (p.body_type === "text/html") box.appendChild(el("div", { class: "dim", text: "This message is HTML; it is shown as source, not rendered." }));
+        box.appendChild(el("pre", { class: "file-text", text: p.body || "(no message text)" }));
+        if (p.truncated) box.appendChild(el("div", { class: "dim", text: "Only the start of the message is shown." }));
+        if (p.attachments.length) {
+          box.appendChild(el("h3", { text: `Attachments (${p.attachments.length})` }));
+          const ul = el("ul", { class: "email-attachments" });
+          for (const a of p.attachments) ul.appendChild(el("li", { text: `${a.name} - ${a.type}, ${fmtBytes(a.size)}` }));
+          box.appendChild(ul);
+        }
+      } else {
+        if (p.mode === "hex") box.appendChild(el("div", { class: "dim", text: "Not text, so it is shown byte by byte (hex on the left, readable characters on the right)." }));
+        box.appendChild(el("pre", { class: "file-text", text: p.text }));
+        if (p.truncated) box.appendChild(el("div", { class: "dim", text: "Only the start of the file is shown." }));
+      }
+    } catch (e) {
+      box.innerHTML = "";
+      box.appendChild(el("div", { class: "error-box", text: "Could not read the file: " + e.message }));
+    }
+  }
+}
+
+// --- AI setup: local model or API key --------------------------------------
+//
+// One component, used on the first-run screen and at the top of Settings.
+// It asks the question a newcomer actually has - "where does the AI run?" -
+// and makes each answer concrete: local AI shows whether Ollama is running
+// and which models are installed; a service asks for one key and tests it;
+// "no AI" says plainly what still works. Detection comes from /api/ai/status
+// (core/ai_setup.py), which never returns a key.
+
+const AI_CLOUD_ORDER = ["anthropic", "openai", "gemini"];
+
+async function renderAiSetup(container, opts) {
+  const options = opts || {};
+  const refresh = options.refresh ? "?refresh=1" : "";
+  container.innerHTML = "";
+  container.appendChild(el("div", { class: "loading", text: "Checking how the AI assistant is set up…" }));
+  let s;
+  try {
+    s = await apiGet("/ai/status" + refresh);
+  } catch (e) {
+    container.innerHTML = "";
+    container.appendChild(el("div", { class: "error-box", text: "Could not check the AI setup: " + e.message }));
+    return;
+  }
+  container.innerHTML = "";
+
+  const current = el("div", { class: "ai-current " + (s.ready ? "is-ready" : "not-ready"), role: "status" });
+  const where = s.mode === "local" ? `on this computer with ${s.model}` : `through ${(s.cloud[s.provider] || {}).name || s.provider}`;
+  current.appendChild(
+    el("b", { text: s.ready ? `The AI assistant runs ${where}.` : `The AI assistant is not ready yet.` })
+  );
+  if (!s.ready && s.not_ready_reason) current.appendChild(el("div", { class: "dim", text: s.not_ready_reason }));
+  if (s.ready && s.mode === "cloud") current.appendChild(el("div", { class: "dim", text: "A key is saved. Use Test to confirm the service accepts it." }));
+  container.appendChild(current);
+
+  const choices = el("div", { class: "ai-choices" });
+  container.appendChild(choices);
+
+  // --- 1. local ---
+  const local = el("section", { class: "ai-choice" + (s.mode === "local" ? " chosen" : ""), "aria-labelledby": "ai-local-h" });
+  local.appendChild(el("h3", { id: "ai-local-h", text: "On this computer (local AI)" }));
+  local.appendChild(
+    el("p", {
+      class: "dim",
+      text: "Private: evidence never leaves this machine. Free. Uses Ollama to run an open model; answers are slower than a cloud service and depend on your hardware.",
+    })
+  );
+  if (s.local.reachable) {
+    local.appendChild(el("div", { class: "ai-ok", text: `Ollama is running at ${s.local.base_url}.` }));
+    if (s.local.models.length) {
+      const pick = el("select", { "aria-label": "Local model" });
+      for (const m of s.local.models) {
+        const o = el("option", { value: m.name, text: `${m.name}${m.parameters ? ` (${m.parameters})` : ""} - ${m.size_gb} GB` });
+        if (m.name === s.model || m.name === `${s.model}:latest`) o.setAttribute("selected", "selected");
+        pick.appendChild(o);
+      }
+      const use = el("button", { type: "button", text: "Use local AI" });
+      use.addEventListener("click", async () => {
+        use.disabled = true;
+        try {
+          await apiPost("/settings", { ai_provider: "ollama", ai_model: pick.value });
+          toast(`The assistant will now run on this computer with ${pick.value}.`);
+          await renderAiSetup(container, options);
+          if (options.onDone) options.onDone();
+        } catch (e) {
+          toast("Could not save: " + e.message, true);
+          use.disabled = false;
+        }
+      });
+      local.appendChild(el("div", { class: "filter-bar" }, [el("label", { class: "dim", text: "Model" }), pick, use]));
+    } else {
+      local.appendChild(el("div", { class: "file-note", text: "No models are installed yet. Download one (see below), then check again." }));
+    }
+  } else {
+    local.appendChild(el("div", { class: "dim", text: s.local.error || "Ollama was not found." }));
+  }
+  const steps = el("details", { class: "ai-steps" + (s.local.reachable ? "" : " open-hint") });
+  if (!s.local.reachable) steps.setAttribute("open", "");
+  steps.appendChild(el("summary", { text: s.local.reachable ? "Add another model" : "How to set up local AI (about 10 minutes)" }));
+  const ol = el("ol");
+  if (!s.local.reachable) {
+    ol.appendChild(el("li", {}, [document.createTextNode("Install Ollama from "), el("a", { href: "https://ollama.com/download", target: "_blank", rel: "noopener noreferrer", text: "ollama.com/download" }), document.createTextNode(" and start it.")]));
+  }
+  const rec = s.recommended_local_models[0];
+  ol.appendChild(el("li", {}, [document.createTextNode("Download a model - in a terminal run "), el("code", { text: `ollama pull ${rec.name}`, translate: "no" }), document.createTextNode(".")]));
+  const recList = el("ul", { class: "ai-recs" });
+  for (const m of s.recommended_local_models) recList.appendChild(el("li", {}, [el("code", { text: m.name, translate: "no" }), document.createTextNode(` - ${m.why}`)]));
+  ol.appendChild(el("li", {}, [document.createTextNode("Good choices for this tool:"), recList]));
+  ol.appendChild(el("li", { text: "Come back here and press Check again." }));
+  steps.appendChild(ol);
+  local.appendChild(steps);
+  const recheck = el("button", { type: "button", class: "secondary", text: "Check again" });
+  recheck.addEventListener("click", () => renderAiSetup(container, { ...options, refresh: true }));
+  local.appendChild(recheck);
+  choices.appendChild(local);
+
+  // --- 2. cloud ---
+  const cloud = el("section", { class: "ai-choice" + (s.mode === "cloud" && s.ready ? " chosen" : ""), "aria-labelledby": "ai-cloud-h" });
+  cloud.appendChild(el("h3", { id: "ai-cloud-h", text: "With an AI service (API key)" }));
+  cloud.appendChild(
+    el("p", {
+      class: "dim",
+      text: "Fast and capable. The evidence the assistant retrieves for a question is sent to the service you choose, and every request is recorded in the chain of custody. Needs an API key from that service.",
+    })
+  );
+  const provider = el("select", { "aria-label": "AI service" });
+  for (const slug of AI_CLOUD_ORDER) {
+    const info = s.cloud[slug];
+    const o = el("option", { value: slug, text: `${info.name}${info.key_set ? " - key saved" : ""}` });
+    if (slug === s.provider) o.setAttribute("selected", "selected");
+    provider.appendChild(o);
+  }
+  const key = el("input", { type: "password", autocomplete: "off", spellcheck: "false", placeholder: "Paste the API key…" });
+  const getKey = el("a", { target: "_blank", rel: "noopener noreferrer" });
+  const syncHint = () => {
+    const info = s.cloud[provider.value];
+    getKey.href = info.get_key_url;
+    getKey.textContent = `Get an API key from ${info.name}`;
+    key.placeholder = info.key_set ? `Saved (${info.key_hint}) - paste a new one to replace it…` : "Paste the API key…";
+  };
+  provider.addEventListener("change", syncHint);
+  syncHint();
+  const save = el("button", { type: "button", text: "Save and test" });
+  const result = el("div", { class: "dim", "aria-live": "polite" });
+  save.addEventListener("click", async () => {
+    const slug = provider.value;
+    const info = s.cloud[slug];
+    if (!key.value.trim() && !info.key_set) {
+      result.textContent = "Paste an API key first.";
+      return;
+    }
+    save.disabled = true;
+    result.textContent = "Saving and testing…";
+    try {
+      const body = { ai_provider: slug, ai_model: "" };
+      if (key.value.trim()) body[`${slug}_api_key`] = key.value.trim();
+      await apiPost("/settings", body);
+      key.value = "";
+      const t = await apiPost("/settings/test", { target: slug });
+      result.textContent = t.ok ? `${info.name} works - the assistant will use it.` : `Saved, but the test failed: ${t.message}`;
+      if (t.ok && options.onDone) options.onDone();
+      toast(t.ok ? `${info.name} is set up.` : `${info.name}: ${t.message}`, !t.ok);
+    } catch (e) {
+      result.textContent = "Could not save: " + e.message;
+    } finally {
+      save.disabled = false;
+    }
+  });
+  cloud.appendChild(el("div", { class: "filter-bar" }, [provider, key, save]));
+  cloud.appendChild(getKey);
+  cloud.appendChild(result);
+  choices.appendChild(cloud);
+
+  // --- 3. none ---
+  const none = el("section", { class: "ai-choice", "aria-labelledby": "ai-none-h" });
+  none.appendChild(el("h3", { id: "ai-none-h", text: "No AI for now" }));
+  none.appendChild(
+    el("p", {
+      class: "dim",
+      text: "Everything except the assistant works without AI: the detections, What happened, recovered files, conversations, the timeline and reports. You can set up AI here any time.",
+    })
+  );
+  choices.appendChild(none);
+}
+
+// --- Application shell: rail, case switcher, status bar --------------
+//
+// The rail, the switcher and the status bar are chrome: they persist
+// across routes and are re-rendered from the case the router already
+// fetched, rather than each re-fetching it.
+
+function icon(path, opts) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", (opts && opts.size) || 16);
+  svg.setAttribute("height", (opts && opts.size) || 16);
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", (opts && opts.stroke) || "currentColor");
+  svg.setAttribute("stroke-width", (opts && opts.width) || 1.8);
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  // These icons are decorative - every one sits beside its own text label,
+  // so hide them from assistive tech rather than reading 25 unnamed graphics.
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  svg.innerHTML = path;
+  return svg;
+}
+
+const ICONS = {
+  overview: '<path d="M3 10.5L12 3l9 7.5"/><path d="M5.5 9.5V21h13V9.5"/>',
+  evidence: '<rect x="3" y="6" width="18" height="14" rx="2"/><path d="M3 10h18"/>',
+  capture: '<circle cx="12" cy="12" r="3"/><path d="M5 8a9 9 0 0 0 0 8M19 8a9 9 0 0 1 0 8"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/>',
+  streams: '<path d="M4 8h10M4 16h16"/><circle cx="17" cy="8" r="2.2"/><circle cx="7" cy="16" r="2.2"/>',
+  triage: '<path d="M5 4h11l4 4v12H5z"/><path d="M9 13l2 2 4-4"/>',
+  timeline: '<circle cx="12" cy="12" r="8"/><path d="M12 7.5V12l3 2"/>',
+  entities: '<circle cx="9" cy="9" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="8" r="2.4"/>',
+  detections: '<path d="M12 3l8 3.5v6c0 4.6-3.2 8.5-8 10.5-4.8-2-8-5.9-8-10.5v-6z"/><path d="M12 9v4"/>',
+  attack: '<circle cx="6" cy="12" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="18" cy="18" r="2.4"/><path d="M8.2 10.9l7.6-3.8M8.2 13.1l7.6 3.8"/>',
+  findings: '<path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h5"/>',
+  reports: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+  audit: '<path d="M6 3h12v18l-6-3-6 3z"/>',
+  team: '<circle cx="8" cy="8" r="3"/><circle cx="16" cy="8" r="3"/><path d="M2.5 20a5.5 5.5 0 0 1 11 0M10.5 20a5.5 5.5 0 0 1 11 0"/>',
+  chat: '<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.2A8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z"/>',
+  check: '<path d="M5 12l5 5L20 7"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+  event: '<path d="M3 13h4l3-8 4 16 3-8h4"/>',
+  arrow: '<path d="M5 12h13M13 6l6 6-6 6"/>',
+  story: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H12v18H6.5A2.5 2.5 0 0 1 4 18.5z"/><path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H12v18h5.5A2.5 2.5 0 0 0 20 18.5z"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  upload: '<path d="M12 15V4M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/>',
+  indicators: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>',
+};
+
+// tab -> [group, label, icon]. The group headings are the four stages of
+// an investigation; `null` means the item stands alone.
+const RAIL = [
+  [null, "overview", "Overview", "overview"],
+  [null, "story", "What happened", "story"],
+  ["Evidence", "evidence", "Evidence", "evidence"],
+  [null, "files", "Recovered files", "file"],
+  [null, "capture", "Live capture", "capture"],
+  ["Dig", "search", "Search", "search"],
+  [null, "streams", "Conversations", "streams"],
+  [null, "triage", "Triage", "triage"],
+  ["Analysis", "timeline", "Timeline", "timeline"],
+  [null, "entities", "Entities", "entities"],
+  [null, "detections", "Detections", "detections"],
+  [null, "iocs", "Threat intel", "indicators"],
+  [null, "attack", "ATT&CK", "attack"],
+  ["Conclude", "findings", "Findings", "findings"],
+  [null, "reports", "Reports", "reports"],
+  [null, "audit", "Chain of custody", "audit"],
+  ["Assistant", "chat", "Ask (cited)", "chat"],
+  [null, "team", "Investigation team", "team"],
+];
+
+// Surfaces that cannot work without tshark. Disabled with a reason
+// rather than hidden - see the CSS note on .rail a.locked.
+const NEEDS_TSHARK = new Set(["search", "streams", "triage"]);
+
+let _wiresharkStatus = null;
+
+async function wiresharkStatus() {
+  if (_wiresharkStatus === null) {
+    try {
+      _wiresharkStatus = await apiGet("/wireshark/status");
+    } catch (e) {
+      _wiresharkStatus = { available: false, error: e.message };
+    }
+  }
+  return _wiresharkStatus;
+}
+
+function renderRail(caseId, tab, tshark) {
+  const nav = document.getElementById("case-nav");
+  nav.innerHTML = "";
+  nav.hidden = false;
+  for (const [group, key, label, iconKey] of RAIL) {
+    if (group) nav.appendChild(el("div", { class: "rail-group", text: group }));
+    const locked = NEEDS_TSHARK.has(key) && tshark && !tshark.available;
+    const link = el("a", {
+      href: locked ? "#" : `#/case/${caseId}/${key}`,
+      class: "rail-link" + (key === tab ? " active" : "") + (locked ? " locked" : ""),
+      title: locked ? "Needs tshark - install Wireshark to enable this" : "",
+    });
+    link.appendChild(icon(ICONS[iconKey]));
+    link.appendChild(document.createTextNode(label));
+    if (key === tab) link.appendChild(icon(ICONS.arrow, { size: 13 })).classList.add("chev");
+    if (locked) link.onclick = (ev) => ev.preventDefault();
+    nav.appendChild(link);
+  }
+}
+
+async function renderCaseSwitch(c) {
+  const box = document.getElementById("case-switch");
+  box.innerHTML = "";
+  box.appendChild(el("span", { class: "dim", text: "Case" }));
+
+  const select = el("select", { title: "Switch case" });
+  select.appendChild(el("option", { value: c.case_id, text: `${c.case_id} · ${c.name}` }));
+  select.onchange = () => {
+    location.hash = `#/case/${select.value}/overview`;
+  };
+  box.appendChild(select);
+
+  const analysed = c.event_count > 0;
+  box.appendChild(
+    el("div", { class: "case-meta" }, [
+      el("span", { class: "dot " + (analysed ? "ok" : "idle") }),
+      el("span", { text: analysed ? "Analyzed" : "Not analyzed" }),
+      el("span", { class: "badge badge-" + cssClass(c.status), text: c.status }),
+      el("span", {
+        class: "dim",
+        text: `${c.evidence_count} evidence item${c.evidence_count === 1 ? "" : "s"}`,
+      }),
+    ])
+  );
+
+  // Populated after the first paint: the switcher must not wait on a
+  // second request before the case it already has can be shown.
+  try {
+    const cases = await apiGet("/cases?brief=1");
+    select.innerHTML = "";
+    for (const other of cases) {
+      const opt = el("option", { value: other.case_id, text: `${other.case_id} · ${other.name}` });
+      if (other.case_id === c.case_id) opt.selected = true;
+      select.appendChild(opt);
+    }
+  } catch (e) {
+    /* one case in the switcher is still a usable switcher */
+  }
+}
+
+async function renderCaptureCard(caseId) {
+  const box = document.getElementById("capture-card");
+  box.innerHTML = "";
+  let snap;
+  try {
+    snap = await apiGet(`/cases/${caseId}/capture/status`);
+  } catch (e) {
+    return;
+  }
+  if (!snap.running) return;
+
+  const card = el("div", { class: "capture-card" });
+  card.appendChild(el("div", { class: "rail-group", style: "padding:0 0 8px", text: "Capture status" }));
+  card.appendChild(
+    el("div", { style: "display:flex;align-items:center;gap:7px;margin-bottom:8px" }, [
+      el("span", { class: "dot ok" }),
+      el("span", { style: "color:var(--ok);font-size:13px", text: "Running" }),
+      el("span", { class: "badge badge-low", style: "margin-left:auto", text: snap.engine || "" }),
+    ])
+  );
+  const rows = [
+    ["Interface", snap.capturing_on || snap.interface || "(default)"],
+    ["Window", (snap.window_packet_count || 0).toLocaleString()],
+    ["Total", (snap.total_packet_count || 0).toLocaleString()],
+    ["Elapsed", formatDuration(snap.elapsed_seconds || 0)],
+  ];
+  for (const [k, v] of rows) {
+    card.appendChild(el("div", { class: "row" }, [el("span", { class: "dim", text: k }), el("span", { text: String(v) })]));
+  }
+  if (snap.consecutive_empty_windows >= 3) {
+    card.appendChild(
+      el("div", {
+        class: "dim",
+        style: "color:var(--warn);margin-top:8px;line-height:1.4",
+        text: `${snap.consecutive_empty_windows} empty windows - wrong interface?`,
+      })
+    );
+  }
+  box.appendChild(card);
+}
+
+function formatDuration(seconds) {
+  const s = Math.floor(seconds % 60);
+  const m = Math.floor((seconds / 60) % 60);
+  const h = Math.floor(seconds / 3600);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+// Each redraw is stamped; after every await, a redraw that has been
+// superseded stops. Two overlapping redraws (navigation plus a settings
+// change) would otherwise both append, duplicating items.
+let _statusBarRender = 0;
+
+async function renderStatusBar(c) {
+  const stamp = ++_statusBarRender;
+  const bar = document.getElementById("statusbar");
+  const tshark = await wiresharkStatus();
+  if (stamp !== _statusBarRender) return;
+  bar.innerHTML = "";
+  bar.appendChild(el("span", { text: "TrustTrace" }));
+
+  bar.appendChild(
+    el("span", { class: "item" }, [
+      el("span", { class: "dot " + (tshark.available ? "ok" : "bad") }),
+      el("span", { text: tshark.available ? `tshark ${tshark.version || ""}`.trim() : "tshark not found" }),
+    ])
+  );
+  if (tshark.dumpcap) {
+    bar.appendChild(el("span", { class: "item" }, [el("span", { class: "dot ok" }), el("span", { text: "dumpcap" })]));
+  }
+  try {
+    const ai = await apiGet("/ai/status");
+    if (stamp !== _statusBarRender) return;
+    const label = !ai.ready
+      ? "AI: not set up"
+      : ai.mode === "local"
+        ? `AI: local (${ai.model})`
+        : `AI: ${(ai.cloud[ai.provider] || {}).name || ai.provider}`;
+    bar.appendChild(
+      el("a", { class: "item", href: "#/settings", title: ai.not_ready_reason || "Change how the AI assistant runs" }, [
+        el("span", { class: "dot " + (ai.ready ? "ok" : "bad") }),
+        el("span", { text: label }),
+      ])
+    );
+  } catch (e) {
+    /* the status bar never blocks on the AI check */
+  }
+  if (c) {
+    bar.appendChild(el("span", { class: "right", text: `cases/${c.case_id}` }));
+  }
+}

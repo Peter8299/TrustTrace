@@ -1,0 +1,179 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  lint:
+    # A fast, dependency-light gate: ruff is configured in pyproject.toml
+    # ([tool.ruff]) with a curated rule set, so this fails the build on real
+    # defects (unused names, likely bugs, unsorted imports) without the
+    # stylistic churn a default config would introduce.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        # Pinned so a future ruff release adding rules to the selected
+        # families can't fail the build without a deliberate bump here.
+        run: pip install ruff==0.16.9
+      - name: Lint
+        run: ruff check .
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor declared in pyproject.toml's requires-python;
+        # 3.12 is what this project has actually been developed/tested
+        # against day to day. The `ai` extra (anthropic>=1.0) requires
+        # Python >=3.10 itself - that's the SDK's own constraint, not
+        # something to work around - so it (and the other AI provider
+        # extras, ai-openai/ai-gemini) are only installed on 3.12 here.
+        # Tests that need any of them skip cleanly on 3.9 via
+        # pytest.importorskip.
+        #
+        # Windows and macOS run on 3.12 because TrustTrace targets
+        # analyst workstations (Windows path handling, .evtx, Wireshark
+        # discovery under C:\Program Files) - the pure-Python path must be
+        # proven on those OSes, not just Linux. tshark is not installed on
+        # these runners, so the Wireshark tests skip cleanly there; the
+        # dedicated `wireshark` job below exercises that path on Linux.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.9"
+            extras: "dev,pcap,intel,evtx,web"
+          - os: ubuntu-latest
+            python-version: "3.12"
+            extras: "dev,pcap,intel,evtx,ai,ai-openai,ai-gemini,web"
+          - os: windows-latest
+            python-version: "3.12"
+            extras: "dev,pcap,intel,evtx,ai,ai-openai,ai-gemini,web"
+          - os: macos-latest
+            python-version: "3.12"
+            extras: "dev,pcap,intel,evtx,ai,ai-openai,ai-gemini,web"
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install package with test-relevant extras
+        # dashboard (dash/plotly) is deliberately omitted: nothing in the
+        # test suite imports trusttrace.dashboard, so installing it
+        # here would just be extra time spent on an untested code path.
+        run: pip install -e ".[${{ matrix.extras }}]"
+
+      - name: Run tests
+        run: pytest -q
+
+  wireshark:
+    # The Wireshark integration is optional and its tests skip when tshark
+    # is absent - which means the matrix job above, on a runner with no
+    # Wireshark, reports green while never executing a single line of the
+    # tshark engine, the display-filter code, or the dumpcap backend. This
+    # job exists so that "the tests passed" actually covers them.
+    #
+    # It mirrors the matrix job rather than replacing it: that one proves
+    # the pure-Python fallback still works with Wireshark absent, this one
+    # proves the Wireshark path works with it present. Both matter,
+    # because either can break without the other noticing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install tshark
+        # tshark only, not the `wireshark` metapackage, which would pull in
+        # Qt and the whole desktop stack for no benefit: the GUI-pivot
+        # tests only build and print commands, they never launch anything.
+        # DEBIAN_FRONTEND stops the wireshark-common postinst prompting
+        # about who may capture packets, which would hang the runner.
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -1
+
+      - name: Install package with test-relevant extras
+        run: pip install -e ".[dev,pcap,intel,evtx,web]"
+
+      - name: Confirm the Wireshark path is actually being exercised
+        # Without this, a discovery regression would quietly send every
+        # Wireshark test back to skipping and this job would still pass -
+        # which is the exact failure mode the job was added to prevent.
+        run: |
+          python -c "
+          from trusttrace.integrations import wireshark
+          assert wireshark.available(), 'tshark is installed but was not discovered'
+          print('tshark discovered:', wireshark.version(), wireshark.tshark_path())
+          "
+
+      - name: Run tests
+        run: pytest -q
+
+  coverage:
+    # Enforces a coverage floor so it can't silently erode. Installs tshark
+    # and the full extras (incl. AI providers) so the measured percentage
+    # reflects the real, fully-exercised codebase - the same conditions the
+    # 89% baseline was measured under - rather than a partial run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install tshark
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -1
+      - name: Install package with all test-relevant extras
+        run: pip install -e ".[dev,pcap,intel,evtx,ai,ai-openai,ai-gemini,web]"
+      - name: Run tests with coverage gate
+        # Floor set below the ~89% baseline to leave headroom for
+        # environment variance without letting coverage quietly regress.
+        run: pytest -q --cov=trusttrace --cov-report=term-missing --cov-fail-under=85
+
+  build-check:
+    # Separate from the test matrix: this only needs to run once and
+    # exists to catch packaging regressions (e.g. a new static/data file
+    # added without updating [tool.setuptools.package-data]) that the
+    # editable install the test job uses would never surface.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Check package metadata
+        run: twine check dist/*
+      - name: Confirm the web UI's static assets are bundled
+        run: |
+          python -m venv /tmp/install-check
+          /tmp/install-check/bin/pip install --quiet dist/*.whl
+          /tmp/install-check/bin/python -c "
+          import trusttrace.web as w, pathlib, sys
+          index = pathlib.Path(w.__file__).parent / 'static' / 'index.html'
+          if not index.exists():
+              sys.exit(f'missing bundled static asset: {index}')
+          print(f'found {index}')
+          "

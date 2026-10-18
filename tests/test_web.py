@@ -1,0 +1,831 @@
+"""API-level tests for the web UI backend, using Flask's test client.
+Seeds a case through the real core modules (same pattern as the other
+integration tests), then exercises the JSON API - proves the web layer
+is correctly wired to the existing core modules, not a reimplementation."""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from trusttrace.core.case import CaseManager
+from trusttrace.core.correlation import correlate_case
+from trusttrace.core.entities import extract_and_store
+from trusttrace.core.evidence import EvidenceManager
+from trusttrace.core.finding import FindingManager
+from trusttrace.core.store import CaseStore
+from trusttrace.web.app import create_app
+
+
+@pytest.fixture
+def prepared_case(tmp_path):
+    cases_dir = tmp_path / "cases"
+    case_manager = CaseManager(cases_dir)
+    case = case_manager.create(name="Web UI test case", investigator="alice")
+    case_dir = cases_dir / case.case_id
+
+    source = tmp_path / "events.json"
+    source.write_text(
+        json.dumps(
+            [
+                {"timestamp": "2026-08-27T09:00:00Z", "type": "authentication", "user": "jdoe", "src_ip": "192.168.1.10"},
+                {"timestamp": "2026-08-27T09:00:30Z", "type": "network_connection", "src_ip": "192.168.1.10", "dst_ip": "203.0.113.7", "dst_port": 4444},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    evidence_manager = EvidenceManager(case_dir)
+    evidence = evidence_manager.add(source, case_id=case.case_id)
+    case_manager.register_evidence(case.case_id, evidence.evidence_id)
+
+    from trusttrace.parsers.generic import JsonParser
+
+    events = JsonParser().parse(evidence_manager.stored_file_path(evidence.evidence_id), evidence_id=evidence.evidence_id)
+
+    with CaseStore(case_dir) as store:
+        store.replace_events_for_evidence(evidence.evidence_id, events)
+        extract_and_store(store, events)
+        correlate_case(store)
+
+    finding_manager = FindingManager(case_dir)
+    finding_manager.create(
+        case_id=case.case_id,
+        title="Suspicious outbound connection",
+        created_by="alice",
+        evidence_refs=[{"evidence_id": evidence.evidence_id, "event_id": events[1].event_id}],
+    )
+
+    app = create_app(cases_dir)
+    client = app.test_client()
+    # Every state-changing request needs this header - see the CSRF
+    # paragraph in web/app.py's module docstring. Setting it as a default
+    # on the client (rather than per-call) matches what the real frontend
+    # does: send it unconditionally on every request.
+    client.environ_base["HTTP_X_REQUESTED_WITH"] = "TrustTrace"
+    return client, case, cases_dir
+
+
+def test_post_without_csrf_header_is_rejected(prepared_case):
+    # A plain client (no default X-Requested-With) approximates a
+    # cross-origin form/fetch a malicious page could submit blindly - it
+    # must be refused before it ever reaches case/evidence logic.
+    _client, case, cases_dir = prepared_case
+    bare_client = create_app(cases_dir).test_client()
+
+    response = bare_client.post(f"/api/cases/{case.case_id}/analyze")
+
+    assert response.status_code == 403
+    assert "X-Requested-With" in response.get_json()["error"]
+
+
+def test_get_does_not_require_csrf_header(prepared_case):
+    _client, case, cases_dir = prepared_case
+    bare_client = create_app(cases_dir).test_client()
+
+    response = bare_client.get(f"/api/cases/{case.case_id}")
+
+    assert response.status_code == 200
+
+
+def test_index_serves_html(prepared_case):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"<html" in response.data.lower() or b"<!doctype" in response.data.lower()
+
+
+def test_list_cases(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get("/api/cases")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert any(c["case_id"] == case.case_id for c in data)
+
+
+def test_get_case_includes_counts(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["evidence_count"] == 1
+    assert data["event_count"] == 2
+    assert data["entity_count"] > 0
+    assert data["finding_count"] == 1
+    assert data["detection_count"] == 0  # the fixture never runs analyze/scan_detections
+
+
+def test_get_case_missing_returns_404(prepared_case):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.get("/api/cases/INC-9999")
+
+    assert response.status_code == 404
+    assert "error" in response.get_json()
+
+
+def test_list_evidence(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/evidence")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data) == 1
+    assert data[0]["evidence_type"] == "json"
+
+
+def test_timeline_unfiltered(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/timeline")
+
+    assert response.status_code == 200
+    assert len(response.get_json()) == 2
+
+
+def test_timeline_filtered_by_user(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/timeline?user=jdoe")
+
+    data = response.get_json()
+    assert len(data) == 1
+    assert data[0]["event_type"] == "authentication"
+
+
+def test_list_entities_and_search(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    all_entities = client.get(f"/api/cases/{case.case_id}/entities").get_json()
+    assert len(all_entities) > 0
+
+    filtered = client.get(f"/api/cases/{case.case_id}/entities?q=192.168").get_json()
+    assert all("192.168" in e["value"] for e in filtered)
+    assert len(filtered) >= 1
+
+
+def test_entity_graph(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    entities = client.get(f"/api/cases/{case.case_id}/entities?type=ip_address").get_json()
+    entity_id = next(e["entity_id"] for e in entities if e["value"] == "192.168.1.10")
+
+    response = client.get(f"/api/cases/{case.case_id}/entities/{entity_id}/graph")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["entity"]["value"] == "192.168.1.10"
+    assert isinstance(data["related"], list)
+
+
+def test_entity_graph_missing_entity_returns_404(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/entities/ENT-does-not-exist/graph")
+
+    assert response.status_code == 404
+
+
+def test_investigate_endpoint(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/investigate?type=ip_address&value=192.168.1.10")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["entity"]["value"] == "192.168.1.10"
+    assert len(data["timeline"]) >= 1
+    assert isinstance(data["leads"], list)
+
+
+def test_investigate_missing_params_returns_400(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/investigate?type=ip_address")
+
+    assert response.status_code == 400
+
+
+def test_investigate_unknown_entity_returns_404(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/investigate?type=ip_address&value=10.0.0.99")
+
+    assert response.status_code == 404
+
+
+def test_list_findings(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/findings")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data) == 1
+    assert data[0]["title"] == "Suspicious outbound connection"
+
+
+def test_audit_endpoint_returns_the_chain(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/audit")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["intact"] is True
+    assert data["problems"] == []
+    actions = [e["action"] for e in data["entries"]]
+    assert "case.created" in actions
+    assert "evidence.added" in actions
+
+
+def test_audit_endpoint_reports_a_broken_chain(prepared_case):
+    import json as _json
+
+    from trusttrace.core import audit
+
+    client, case, cases_dir = prepared_case
+    path = audit.audit_path(cases_dir / case.case_id)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    tampered = _json.loads(lines[0])
+    tampered["actor"] = "someone-else"
+    lines[0] = _json.dumps(tampered, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    data = client.get(f"/api/cases/{case.case_id}/audit").get_json()
+
+    assert data["intact"] is False
+    assert data["problems"]
+
+
+def test_list_attack_techniques_empty(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/attack")
+
+    assert response.status_code == 200
+    assert response.get_json() == []
+
+
+def test_list_attack_techniques_after_scan(prepared_case):
+    from datetime import datetime, timezone
+
+    client, case, cases_dir = prepared_case
+    with CaseStore(cases_dir / case.case_id) as store:
+        store.upsert_technique(
+            "T1059.001", "Command and Scripting Interpreter: PowerShell", "medium", datetime.now(timezone.utc)
+        )
+        store.link_technique_event("T1059.001", "EVT-FAKE", "EV-0001", "test basis")
+
+    response = client.get(f"/api/cases/{case.case_id}/attack")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data) == 1
+    assert data[0]["technique_id"] == "T1059.001"
+    assert data[0]["status"] == "potential"
+    assert data[0]["event_count"] == 1
+
+
+def test_create_finding(prepared_case):
+    client, case, _cases_dir = prepared_case
+    timeline = client.get(f"/api/cases/{case.case_id}/timeline").get_json()
+    event_id = timeline[0]["event_id"]
+
+    response = client.post(
+        f"/api/cases/{case.case_id}/findings",
+        json={
+            "title": "New finding from the web UI",
+            "severity": "High",
+            "status": "Investigating",
+            "assessment": "Looks like a beacon.",
+            "event_ids": [event_id],
+        },
+    )
+
+    assert response.status_code == 201, response.get_json()
+    data = response.get_json()
+    assert data["finding_id"] == "F-0002"  # F-0001 already exists from the fixture
+    assert data["title"] == "New finding from the web UI"
+    assert data["severity"] == "High"
+    assert data["status"] == "Investigating"
+    assert data["evidence_refs"] == [{"evidence_id": data["evidence_refs"][0]["evidence_id"], "event_id": event_id}]
+
+    listed = client.get(f"/api/cases/{case.case_id}/findings").get_json()
+    assert len(listed) == 2
+
+
+def test_create_finding_requires_title(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/findings", json={})
+
+    assert response.status_code == 400
+
+
+def test_create_finding_rejects_unknown_event_id(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(
+        f"/api/cases/{case.case_id}/findings",
+        json={"title": "Bad ref", "event_ids": ["EVT-does-not-exist"]},
+    )
+
+    assert response.status_code == 400
+    assert "not found" in response.get_json()["error"]
+
+
+def test_update_finding_status(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/findings/F-0001", json={"status": "Confirmed"})
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "Confirmed"
+
+
+def test_update_finding_note(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(
+        f"/api/cases/{case.case_id}/findings/F-0001", json={"note": "Confirmed with the network team."}
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["investigator_notes"]) == 1
+    assert data["investigator_notes"][0]["text"] == "Confirmed with the network team."
+
+
+def test_update_finding_requires_status_or_note(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/findings/F-0001", json={})
+
+    assert response.status_code == 400
+
+
+def test_update_nonexistent_finding_returns_404(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/findings/F-9999", json={"status": "Confirmed"})
+
+    assert response.status_code == 404
+
+
+def test_report_markdown(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/report/markdown")
+
+    assert response.status_code == 200
+    assert response.mimetype == "text/markdown"
+    assert case.case_id in response.get_data(as_text=True)
+
+
+def test_report_json(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/report/json")
+
+    assert response.status_code == 200
+    data = json.loads(response.get_data(as_text=True))
+    assert data["case"]["case_id"] == case.case_id
+
+
+def test_report_unsupported_format(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/report/pdf")
+
+    assert response.status_code == 400
+
+
+def test_threat_intel_endpoint_missing_fields(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/threat-intel", json={})
+
+    assert response.status_code == 400
+
+
+def test_threat_intel_endpoint_calls_provider(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    entities = client.get(f"/api/cases/{case.case_id}/entities?type=ip_address").get_json()
+    entity = next(e for e in entities if e["value"] == "192.168.1.10")
+
+    with patch(
+        "trusttrace.intel.virustotal.check_ip",
+        return_value={"malicious": True, "malicious_count": 3, "total_engines": 70, "permalink": "https://x", "error": None},
+    ):
+        response = client.post(
+            f"/api/cases/{case.case_id}/threat-intel",
+            json={
+                "entity_id": entity["entity_id"],
+                "entity_type": "ip_address",
+                "value": "192.168.1.10",
+                "api_key": "fake-key",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.get_json()["malicious"] is True
+
+
+def test_ai_hypothesis_endpoint(prepared_case):
+    # patch("anthropic.Anthropic", ...) needs anthropic importable to
+    # resolve the target, even though it's only ever mocked here.
+    pytest.importorskip("anthropic")
+    client, case, _cases_dir = prepared_case
+    from trusttrace.core.ai_assistant import Hypothesis
+
+    hypothesis = Hypothesis(
+        evidence_sufficient=True,
+        claim="May represent routine authentication.",
+        assessment="Likely benign",
+        observed_evidence=["User jdoe authenticated."],
+        confidence="low",
+        alternative_explanation="Normal login.",
+        recommended_validation="Confirm work hours.",
+        evidence=[],
+    )
+    mock_response = MagicMock()
+    mock_response.parsed_output = hypothesis
+    mock_client = MagicMock()
+    mock_client.messages.parse.return_value = mock_response
+
+    with patch("anthropic.Anthropic", return_value=mock_client):
+        response = client.post(
+            f"/api/cases/{case.case_id}/ai-hypothesis",
+            json={"entity_type": "ip_address", "value": "192.168.1.10", "api_key": "fake-key"},
+        )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["claim"] == "May represent routine authentication."
+
+
+def test_ai_hypothesis_endpoint_reports_assistant_error(prepared_case):
+    pytest.importorskip("anthropic")
+    client, case, _cases_dir = prepared_case
+
+    with patch(
+        "anthropic.Anthropic",
+        side_effect=TypeError("Could not resolve authentication method."),
+    ):
+        response = client.post(
+            f"/api/cases/{case.case_id}/ai-hypothesis",
+            json={"entity_type": "ip_address", "value": "192.168.1.10"},
+        )
+
+    assert response.status_code == 502
+    assert "credentials" in response.get_json()["error"]
+
+
+@pytest.fixture
+def isolated_config(tmp_path, monkeypatch):
+    from trusttrace.core import config
+
+    monkeypatch.setenv(config.CONFIG_DIR_ENV, str(tmp_path / "cfg"))
+    for env_var in config.SECRET_KEYS.values():
+        monkeypatch.delenv(env_var, raising=False)
+    return config
+
+
+def test_settings_endpoint_returns_masked_state(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.get("/api/settings")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["secrets"]["virustotal_api_key"]["set"] is False
+    assert data["preferences"]["ai_provider"] == "anthropic"
+
+
+def test_settings_post_saves_and_never_echoes_the_key(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.post("/api/settings", json={"virustotal_api_key": "secret-key-8888"})
+
+    assert response.status_code == 200
+    assert "secret-key-8888" not in response.get_data(as_text=True)
+    entry = response.get_json()["secrets"]["virustotal_api_key"]
+    assert entry["set"] is True
+    assert entry["hint"] == "...8888"
+    # And it really landed where the rest of the app will look for it.
+    assert isolated_config.get_secret("virustotal_api_key") == "secret-key-8888"
+
+
+def test_settings_post_preserves_untouched_keys(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    client.post("/api/settings", json={"virustotal_api_key": "vt-key"})
+    client.post("/api/settings", json={"ai_provider": "ollama"})  # no key field at all
+
+    assert isolated_config.get_secret("virustotal_api_key") == "vt-key"
+    assert isolated_config.get_plain("ai_provider") == "ollama"
+
+
+def test_settings_requires_csrf_header(prepared_case, isolated_config):
+    _client, _case, cases_dir = prepared_case
+    bare_client = create_app(cases_dir).test_client()
+
+    response = bare_client.post("/api/settings", json={"virustotal_api_key": "x"})
+
+    assert response.status_code == 403
+
+
+def test_settings_test_reports_missing_virustotal_key(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.post("/api/settings/test", json={"target": "virustotal"})
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["ok"] is False
+    assert "no virustotal api key" in data["message"].lower()
+
+
+def test_settings_test_reports_success_for_working_virustotal_key(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+    isolated_config.save_settings({"virustotal_api_key": "vt-key"})
+
+    with patch(
+        "trusttrace.intel.virustotal.check_ip",
+        return_value={"malicious": False, "malicious_count": 0, "total_engines": 70, "permalink": None, "error": None},
+    ):
+        response = client.post("/api/settings/test", json={"target": "virustotal"})
+
+    assert response.get_json() == {"ok": True, "message": "VirusTotal key works."}
+
+
+def test_settings_test_reports_ai_provider_failure_cleanly(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    # Ollama needs no SDK, so this exercises the real failure path without
+    # requiring an optional provider package to be installed.
+    import requests
+
+    with patch("requests.post", side_effect=requests.exceptions.ConnectionError("refused")):
+        response = client.post("/api/settings/test", json={"target": "ollama"})
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["ok"] is False
+    assert "ollama serve" in data["message"]
+
+
+def test_settings_test_rejects_unknown_target(prepared_case, isolated_config):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.post("/api/settings/test", json={"target": "nonsense"})
+
+    assert response.status_code == 400
+
+
+def test_ai_providers_endpoint_lists_all_providers():
+    from trusttrace.core.ai_assistant import DEFAULT_MODELS, SUPPORTED_PROVIDERS
+
+    app = create_app("cases")
+    client = app.test_client()
+
+    response = client.get("/api/ai-providers")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert set(data["providers"]) == set(SUPPORTED_PROVIDERS)
+    assert data["default_models"] == DEFAULT_MODELS
+
+
+def test_ai_hypothesis_endpoint_passes_provider_and_model_through(prepared_case):
+    # Ollama needs no SDK (just `requests`, already a hard dependency of
+    # the test env via other extras), so this exercises the web layer's
+    # provider/model/base_url passthrough without needing an optional
+    # provider package installed.
+    client, case, _cases_dir = prepared_case
+    from trusttrace.core.ai_assistant import Hypothesis
+
+    hypothesis = Hypothesis(
+        evidence_sufficient=True,
+        claim="May represent routine authentication.",
+        assessment="Likely benign",
+        observed_evidence=["User jdoe authenticated."],
+        confidence="low",
+        alternative_explanation="Normal login.",
+        recommended_validation="Confirm work hours.",
+        evidence=[],
+    )
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"message": {"content": hypothesis.model_dump_json()}}
+    mock_response.raise_for_status.return_value = None
+
+    with patch("requests.post", return_value=mock_response) as mock_post:
+        response = client.post(
+            f"/api/cases/{case.case_id}/ai-hypothesis",
+            json={
+                "entity_type": "ip_address",
+                "value": "192.168.1.10",
+                "provider": "ollama",
+                "model": "custom-model",
+                "base_url": "http://127.0.0.1:11434",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.get_json()["claim"] == "May represent routine authentication."
+    assert mock_post.call_args.args[0] == "http://127.0.0.1:11434/api/chat"
+    assert mock_post.call_args.kwargs["json"]["model"] == "custom-model"
+
+
+def test_ai_hypothesis_endpoint_rejects_unknown_provider(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(
+        f"/api/cases/{case.case_id}/ai-hypothesis",
+        json={"entity_type": "ip_address", "value": "192.168.1.10", "provider": "chatgpt-3000"},
+    )
+
+    assert response.status_code == 502
+    assert "Unknown AI provider" in response.get_json()["error"]
+
+
+# --- evidence upload + analyze ---
+
+
+def test_upload_evidence(prepared_case):
+    import io
+
+    client, case, cases_dir = prepared_case
+
+    content = b'[{"timestamp": "2026-08-27T10:00:00Z", "type": "authentication", "user": "newuser"}]'
+    response = client.post(
+        f"/api/cases/{case.case_id}/evidence",
+        data={"file": (io.BytesIO(content), "uploaded.json")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 201, response.get_json()
+    data = response.get_json()
+    assert data["evidence_id"] == "EV-0002"
+    assert data["filename"] == "uploaded.json"
+    assert data["evidence_type"] == "json"
+
+    stored_path = cases_dir / case.case_id / "evidence" / "EV-0002" / "original" / "uploaded.json"
+    assert stored_path.exists()
+    assert stored_path.read_bytes() == content
+
+
+def test_upload_evidence_no_file_returns_400(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/evidence", data={}, content_type="multipart/form-data")
+
+    assert response.status_code == 400
+
+
+def test_upload_evidence_missing_case_returns_404(prepared_case):
+    import io
+
+    client, _case, _cases_dir = prepared_case
+
+    response = client.post(
+        "/api/cases/INC-9999/evidence",
+        data={"file": (io.BytesIO(b"{}"), "x.json")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 404
+
+
+def test_analyze_endpoint_parses_new_evidence(prepared_case):
+    import io
+
+    client, case, _cases_dir = prepared_case
+
+    client.post(
+        f"/api/cases/{case.case_id}/evidence",
+        data={"file": (io.BytesIO(b'[{"timestamp": "2026-08-27T10:00:00Z", "type": "x", "user": "newuser"}]'), "more.json")},
+        content_type="multipart/form-data",
+    )
+
+    response = client.post(f"/api/cases/{case.case_id}/analyze")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["results"]) == 2  # original EV-0001 + the newly uploaded EV-0002
+    assert data["total_events"] >= 3
+    assert all(r["error"] is None for r in data["results"])
+    # The fixture's network_connection event targets dst_port=4444 - the
+    # SUSPICIOUS-PORT bundled rule should have matched it automatically.
+    assert data["detection_count"] >= 1
+
+    entities = client.get(f"/api/cases/{case.case_id}/entities?q=newuser").get_json()
+    assert len(entities) == 1
+
+
+def test_list_detections_after_analyze(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    client.post(f"/api/cases/{case.case_id}/analyze")
+    response = client.get(f"/api/cases/{case.case_id}/detections")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data) >= 1
+    assert any(d["rule_id"] == "SUSPICIOUS-PORT" for d in data)
+    assert data[0]["detected_at"] is not None
+
+
+def test_list_detections_filters_by_severity(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    client.post(f"/api/cases/{case.case_id}/analyze")
+    # The fixture's only match (SUSPICIOUS-PORT, dst_port=4444) is medium
+    # severity - filtering to "high" should exclude it, proving the
+    # filter actually filters rather than passing vacuously on an empty set.
+    high_response = client.get(f"/api/cases/{case.case_id}/detections?severity=high")
+    medium_response = client.get(f"/api/cases/{case.case_id}/detections?severity=medium")
+
+    assert high_response.get_json() == []
+    assert len(medium_response.get_json()) >= 1
+    assert all(d["severity"] == "medium" for d in medium_response.get_json())
+
+
+def test_list_detections_before_analyze_is_empty(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/detections")
+
+    assert response.status_code == 200
+    assert response.get_json() == []
+
+
+# --- live capture ---
+
+
+def test_capture_status_when_not_running(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.get(f"/api/cases/{case.case_id}/capture/status")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"running": False}
+
+
+def test_capture_start_status_stop_lifecycle(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    with patch("scapy.all.AsyncSniffer") as mock_sniffer_cls:
+        mock_sniffer_cls.return_value = MagicMock()
+
+        start_response = client.post(f"/api/cases/{case.case_id}/capture/start", json={"interface": "fake0"})
+        assert start_response.status_code == 200, start_response.get_json()
+
+        status_response = client.get(f"/api/cases/{case.case_id}/capture/status")
+        status = status_response.get_json()
+        assert status["running"] is True
+        assert status["interface"] == "fake0"
+
+        second_start = client.post(f"/api/cases/{case.case_id}/capture/start", json={"interface": "fake0"})
+        assert second_start.status_code == 409
+
+        stop_response = client.post(f"/api/cases/{case.case_id}/capture/stop")
+        assert stop_response.status_code == 200
+
+        status_after_stop = client.get(f"/api/cases/{case.case_id}/capture/status").get_json()
+        assert status_after_stop["running"] is False
+
+
+def test_capture_stop_when_never_started_returns_404(prepared_case):
+    client, case, _cases_dir = prepared_case
+
+    response = client.post(f"/api/cases/{case.case_id}/capture/stop")
+
+    assert response.status_code == 404
+
+
+def test_capture_start_missing_case_returns_404(prepared_case):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.post("/api/cases/INC-9999/capture/start", json={})
+
+    assert response.status_code == 404
+
+
+def test_list_interfaces_endpoint(prepared_case):
+    client, _case, _cases_dir = prepared_case
+
+    response = client.get("/api/interfaces")
+
+    assert response.status_code == 200
+    assert isinstance(response.get_json(), list)
+
