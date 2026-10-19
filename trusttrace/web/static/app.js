@@ -3158,6 +3158,8 @@ async function renderCapture(app, c) {
   const filterInput = el("input", { placeholder: "BPF filter, e.g. tcp port 443" });
   const rotateInput = el("input", { type: "number", value: "30", min: "5", style: "width:80px;" });
   const rotateLabel = el("span", { text: "sec/window", style: "color:var(--text-dim); font-size:12px;" });
+  const retainCheckbox = el("input", { type: "checkbox", id: "retain-capture" });
+  const retainLabel = el("label", { htmlFor: "retain-capture", text: " Retain pcap files", style: "font-size:12px; margin-left:4px;" });
   const startBtn = el("button", { text: "Start Capture" });
   const stopBtn = el("button", { class: "secondary", text: "Stop Capture" });
   stopBtn.disabled = true;
@@ -3165,6 +3167,8 @@ async function renderCapture(app, c) {
   controlBar.appendChild(filterInput);
   controlBar.appendChild(rotateInput);
   controlBar.appendChild(rotateLabel);
+  controlBar.appendChild(retainCheckbox);
+  controlBar.appendChild(retainLabel);
   controlBar.appendChild(startBtn);
   controlBar.appendChild(stopBtn);
   app.appendChild(controlBar);
@@ -3316,6 +3320,7 @@ async function renderCapture(app, c) {
         interface: interfaceSelect.value || undefined,
         filter: filterInput.value.trim() || undefined,
         rotate_seconds: parseInt(rotateInput.value, 10) || 30,
+        retain_capture: retainCheckbox.checked,
       });
       toast("Capture started.");
       await poll();

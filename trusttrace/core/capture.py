@@ -118,13 +118,14 @@ class CaptureSession:
 
     engine = ENGINE_SCAPY
 
-    def __init__(self, case_id, case_dir, case_manager, interface=None, bpf_filter=None, rotate_seconds=DEFAULT_ROTATE_SECONDS):
+    def __init__(self, case_id, case_dir, case_manager, interface=None, bpf_filter=None, rotate_seconds=DEFAULT_ROTATE_SECONDS, retain_capture=False):
         self.case_id = case_id
         self.case_dir = Path(case_dir)
         self.case_manager = case_manager
         self.interface = interface
         self.bpf_filter = bpf_filter
         self.rotate_seconds = rotate_seconds
+        self.retain_capture = retain_capture
 
         self._sniffer = None
         self._lock = threading.Lock()
@@ -255,10 +256,13 @@ class CaptureSession:
             self._record_event({"error": f"Failed to ingest capture window: {e}"})
             return
         finally:
-            try:
-                Path(pcap_path).unlink(missing_ok=True)
-            except Exception:
-                logger.debug("could not remove temporary pcap %s", pcap_path, exc_info=True)
+            if not self.retain_capture:
+                try:
+                    Path(pcap_path).unlink(missing_ok=True)
+                except Exception:
+                    logger.debug("could not remove temporary pcap %s", pcap_path, exc_info=True)
+            else:
+                logger.info(f"Retained capture file: {pcap_path}")
 
         with locked_store(self.case_dir) as store:
             event_count, entity_count, error = parse_evidence_item(
@@ -678,6 +682,7 @@ def start_capture(
     bpf_filter=None,
     rotate_seconds=DEFAULT_ROTATE_SECONDS,
     engine=None,
+    retain_capture=False,
 ):
     with _SESSIONS_LOCK:
         existing = _SESSIONS.get(case_id)
@@ -685,7 +690,7 @@ def start_capture(
             raise CaptureError(f"Capture already running for case {case_id}.")
         selected = resolve_capture_engine(engine)
         session_class = DumpcapCaptureSession if selected == ENGINE_DUMPCAP else CaptureSession
-        session = session_class(case_id, case_dir, case_manager, interface, bpf_filter, rotate_seconds)
+        session = session_class(case_id, case_dir, case_manager, interface, bpf_filter, rotate_seconds, retain_capture)
         session.start()
         _SESSIONS[case_id] = session
         return session

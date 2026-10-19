@@ -2534,6 +2534,11 @@ def capture_cmd(
         "--rotate-seconds",
         help="Seconds of traffic per capture window before it's rotated and ingested as evidence",
     ),
+    retain_capture: bool = typer.Option(
+        False,
+        "--retain-capture/--no-retain-capture",
+        help="Keep rotation pcap files after ingestion (default: delete after ingestion)",
+    ),
     list_interfaces_flag: bool = typer.Option(
         False, "--list-interfaces", help="List available network interfaces and exit"
     ),
@@ -2597,7 +2602,7 @@ def capture_cmd(
         else capture_module.CaptureSession
     )
     session = session_class(
-        case.case_id, case_dir, case_manager, interface=interface, bpf_filter=bpf_filter, rotate_seconds=rotate_seconds
+        case.case_id, case_dir, case_manager, interface=interface, bpf_filter=bpf_filter, rotate_seconds=rotate_seconds, retain_capture=retain_capture
     )
 
     try:

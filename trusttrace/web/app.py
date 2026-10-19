@@ -1151,6 +1151,7 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
                 bpf_filter=payload.get("filter") or None,
                 rotate_seconds=rotate_seconds,
                 engine=payload.get("engine") or None,
+                retain_capture=bool(payload.get("retain_capture", False)),
             )
         except capture_module.CaptureError as e:
             status = 409 if "already running" in str(e) else 400
