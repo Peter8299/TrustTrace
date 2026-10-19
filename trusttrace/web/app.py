@@ -57,6 +57,7 @@ import hmac
 import logging
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -1168,6 +1169,30 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
         except capture_module.CaptureError as e:
             raise ApiError(str(e), 404)
         return jsonify({"stopped": True})
+
+    @app.route("/api/cases/<case_id>/export", methods=["POST"])
+    def case_export(case_id):
+        """Export the entire case as a zip archive with manifest."""
+        case = _load_case(case_id)
+        from trusttrace.core.export import ExportError, export_case
+        import tempfile
+        import os
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+            export_case(_case_dir(case), tmp_path)
+            from flask import send_file
+            return send_file(
+                tmp_path,
+                as_attachment=True,
+                download_name=f"{case.case_id}-{datetime.now(timezone.utc).date().isoformat()}.zip",
+                mimetype="application/zip",
+            )
+        except ExportError as e:
+            raise ApiError(str(e), 400)
+        except Exception as e:
+            raise ApiError(f"Export failed: {e}")
 
     @app.route("/api/cases/<case_id>/narrative")
     def case_narrative(case_id):

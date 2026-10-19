@@ -1098,6 +1098,7 @@ async function renderOverview(app, c) {
     }
   };
   actions.appendChild(statusSel);
+  actions.appendChild(el("button", { class: "secondary", text: "Export case", onclick: () => exportCase(c) }));
   actions.appendChild(el("button", { class: "danger", text: "Delete case", onclick: () => confirmDelete(c) }));
   head.appendChild(actions);
   app.appendChild(head);
@@ -1840,6 +1841,31 @@ function confirmDelete(c) {
   box.appendChild(card);
   document.body.appendChild(box);
   input.focus();
+}
+
+async function exportCase(c) {
+  const btn = el("button", { class: "secondary", text: "Exporting…" });
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/cases/${c.case_id}/export`, {
+      method: "POST",
+      headers: { "X-Requested-With": "TrustTrace" },
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || res.statusText);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${c.case_id}-${new Date().toISOString().slice(0, 10)}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast(`Exported ${c.case_id}.zip`);
+  } catch (e) {
+    toast("Export failed: " + e.message, true);
+  }
 }
 
 // --- Evidence ---
