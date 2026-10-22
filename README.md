@@ -4,8 +4,8 @@
 
 **Turn packet captures and endpoint logs into one correlated, evidence-cited investigation — entirely on your own machine.**
 
-[![PyPI](https://img.shields.io/pypi/v/trusttrace.svg)](https://pypi.org/project/trusttrace/)
-[![Tests](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml/badge.svg)](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/Peter8299/TrustTrace/releases)
+[![Tests](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Wireshark: optional](https://img.shields.io/badge/wireshark-optional-informational.svg)](docs/wireshark.md)
