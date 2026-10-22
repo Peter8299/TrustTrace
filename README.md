@@ -5,7 +5,7 @@
 **Turn packet captures and endpoint logs into one correlated, evidence-cited investigation — entirely on your own machine.**
 
 [![PyPI](https://img.shields.io/pypi/v/trusttrace.svg)](https://pypi.org/project/trusttrace/)
-[![Tests](https://github.com/Sh3n0bi/TrustTrace/actions/workflows/tests.yml/badge.svg)](https://github.com/Sh3n0bi/TrustTrace/actions/workflows/tests.yml)
+[![Tests](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml/badge.svg)](https://github.com/Peter8299/TrustTrace/actions/workflows/tests.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Wireshark: optional](https://img.shields.io/badge/wireshark-optional-informational.svg)](docs/wireshark.md)
@@ -40,7 +40,7 @@ It runs entirely on your machine. **No cloud backend, no daemon, no database ser
 | **Requires** | Python 3.9+. Wireshark optional but recommended. |
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/story.png" alt="The What happened view of the demo case: a critical assessment, the intrusion stages it passed through, and each finding with the events it cites" width="900">
+  <img src="https://raw.githubusercontent.com/Sh3n0bi/NetForensicAI/main/docs/images/story.png" alt="The What happened view of the demo case: a critical assessment, the intrusion stages it passed through, and each finding with the events it cites" width="900">
 </p>
 
 **See it on your own machine in one command** — no evidence of your own needed:
@@ -56,13 +56,13 @@ trusttrace demo --open
 <br>
 
 **Overview** — the story up front, then the counts.
-<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/overview.png" alt="Case overview dashboard with the story summary and KPI tiles" width="900">
+<img src="https://raw.githubusercontent.com/Sh3n0bi/NetForensicAI/main/docs/images/overview.png" alt="Case overview dashboard with the story summary and KPI tiles" width="900">
 
 **Detections** — offline, deterministic rules, each pointing at the event it matched.
-<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/detections.png" alt="Detections table with severities, rules, events and descriptions" width="900">
+<img src="https://raw.githubusercontent.com/Sh3n0bi/NetForensicAI/main/docs/images/detections.png" alt="Detections table with severities, rules, events and descriptions" width="900">
 
 **Timeline** — every source normalized into one chronological view.
-<img src="https://raw.githubusercontent.com/Sh3n0bi/TrustTrace/TrustTrace/docs/images/timeline.png" alt="Timeline of normalized DNS, HTTP, flow and anomaly events" width="900">
+<img src="https://raw.githubusercontent.com/Sh3n0bi/NetForensicAI/main/docs/images/timeline.png" alt="Timeline of normalized DNS, HTTP, flow and anomaly events" width="900">
 
 <sub>All screenshots are of `trusttrace demo`: fabricated traffic, no real hosts or data.</sub>
 
@@ -135,7 +135,7 @@ pip install "trusttrace[pcap,intel,web]"
 **From source** — for development, or to run the latest unreleased code:
 
 ```bash
-git clone https://github.com/Sh3n0bi/TrustTrace.git
+git clone https://github.com/Peter8299/TrustTrace.git
 cd TrustTrace
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -330,7 +330,7 @@ Stated plainly, because a forensics tool that hides its weaknesses is worse than
 - **The two pcap engines do not produce identical output.** That is the point — tshark sees protocols the scapy engine cannot — but it means a case re-analyzed under a different engine will not have identical events. Each event records the engine that produced it, and `--engine` pins one when reproducibility matters.
 - **tshark object export runs as a second pass** over the capture. It keeps the streaming parse's memory profile intact, at the cost of reading the file twice when an output directory is given.
 - **Exported objects carry no timestamp.** tshark's object export reports the recovered file but not the frame it completed on, so `file_transfer` events from it sort at the end of the timeline as `unknown` rather than in position. A wrong timestamp on forensic evidence is worse than an absent one, so none is invented — the parent flow's events carry the timing.
-- **The web UI has no per-user accounts.** On `127.0.0.1` (the default) it is unauthenticated by design. Binding it off loopback now *requires* a shared token (`--auth-token` / `TRUSTTRACE_WEB_TOKEN`) and the CLI refuses to start without one — but that single token is all the access control there is; still front it with TLS. See [docs/deployment.md](docs/deployment.md).
+- **The web UI has no per-user accounts.** On `127.0.0.1` (the default) it is unauthenticated by design. Binding it off loopback now *requires* a shared token (`--auth-token` / `NETFORENSIC_WEB_TOKEN`) and the CLI refuses to start without one — but that single token is all the access control there is; still front it with TLS. See [docs/deployment.md](docs/deployment.md).
 
 ---
 
