@@ -40,7 +40,7 @@ It runs entirely on your machine. **No cloud backend, no daemon, no database ser
 | **Requires** | Python 3.9+. Wireshark optional but recommended. |
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Peter8299/TrustTrace/main/docs/images/story.png" alt="The What happened view of the demo case: a critical assessment, the intrusion stages it passed through, and each finding with the events it cites" width="900">
+  <img src="docs/images/story.png" alt="The What happened view of the demo case: a critical assessment, the intrusion stages it passed through, and each finding with the events it cites">
 </p>
 
 **See it on your own machine in one command** — no evidence of your own needed:
@@ -56,13 +56,13 @@ trusttrace demo --open
 <br>
 
 **Overview** — the story up front, then the counts.
-<img src="https://raw.githubusercontent.com/Peter8299/TrustTrace/main/docs/images/overview.png" alt="Case overview dashboard with the story summary and KPI tiles" width="900">
+<img src="docs/images/overview.png" alt="Case overview dashboard with the story summary and KPI tiles">
 
 **Detections** — offline, deterministic rules, each pointing at the event it matched.
-<img src="https://raw.githubusercontent.com/Peter8299/TrustTrace/main/docs/images/detections.png" alt="Detections table with severities, rules, events and descriptions" width="900">
+<img src="docs/images/detections.png" alt="Detections table with severities, rules, events and descriptions">
 
 **Timeline** — every source normalized into one chronological view.
-<img src="https://raw.githubusercontent.com/Peter8299/TrustTrace/main/docs/images/timeline.png" alt="Timeline of normalized DNS, HTTP, flow and anomaly events" width="900">
+<img src="docs/images/timeline.png" alt="Timeline of normalized DNS, HTTP, flow and anomaly events">
 
 <sub>All screenshots are of `trusttrace demo`: fabricated traffic, no real hosts or data.</sub>
 
