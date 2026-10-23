@@ -581,12 +581,13 @@ async function renderCaseList(app) {
 
   const counts = { all: cases.length, open: 0, investigating: 0, closed: 0 };
   for (const c of cases) counts[c.status] = (counts[c.status] || 0) + 1;
-  const seg = el("div", { class: "seg", role: "group", "aria-label": "Filter by status" });
+  const seg = el("div", { class: "seg", role: "group", "aria-label": "Filter by status", style: "display:flex; gap:10px;" });
   let status = "all";
   for (const key of ["all", "open", "investigating", "closed"]) {
     const b = el("button", { type: "button", class: "seg-btn" + (key === "all" ? " on" : "") });
     b.setAttribute("aria-pressed", String(key === "all"));
-    b.appendChild(document.createTextNode(key[0].toUpperCase() + key.slice(1)));
+    const label = key[0].toUpperCase() + key.slice(1);
+    b.appendChild(document.createTextNode(label + " "));
     b.appendChild(el("span", { class: "seg-n", text: String(counts[key] || 0) }));
     b.onclick = () => {
       status = key;
