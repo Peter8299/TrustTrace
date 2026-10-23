@@ -9,11 +9,11 @@ that the chain still verifies, and that no API key is ever written.
 import pytest
 from typer.testing import CliRunner
 
+from tests.test_cli_team import _add_json_case
 from trusttrace.cli import app
 from trusttrace.core import ai_assistant, audit, chat
 from trusttrace.core.chat import ChatError, ChatResult, Citation, ToolCall
 from trusttrace.web.app import CSRF_HEADER, CSRF_HEADER_VALUE, create_app
-from tests.test_cli_team import _add_json_case
 
 W = {CSRF_HEADER: CSRF_HEADER_VALUE}
 SECRET = "sk-NEVER-IN-AUDIT"

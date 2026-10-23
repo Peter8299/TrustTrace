@@ -750,9 +750,9 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
             return jsonify({"ok": True, "message": "VirusTotal key works."})
 
         if target in ("anthropic", "openai", "gemini", "ollama", "openai-compatible"):
+            from trusttrace.core import config
             from trusttrace.core.ai_assistant import AssistantError, generate_hypothesis
             from trusttrace.core.event import Event
-            from trusttrace.core import config
 
             probe = Event(
                 event_id="EVT-PROBE-0001",
@@ -1174,9 +1174,9 @@ def create_app(cases_dir="cases", auth_token=None, allowed_hosts=None):
     def case_export(case_id):
         """Export the entire case as a zip archive with manifest."""
         case = _load_case(case_id)
-        from trusttrace.core.export import ExportError, export_case
         import tempfile
-        import os
+
+        from trusttrace.core.export import ExportError, export_case
 
         try:
             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:

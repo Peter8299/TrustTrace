@@ -15,9 +15,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.test_cli_team import _add_json_case
 from trusttrace.core import ai_assistant, chat
 from trusttrace.core.ai_assistant import AssistantError, _json_from_text
-from tests.test_cli_team import _add_json_case
 
 
 @pytest.fixture

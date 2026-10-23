@@ -52,7 +52,7 @@ def test_demo_never_touches_an_existing_case(tmp_path):
 def test_demo_without_scapy_explains_the_extra(tmp_path, monkeypatch):
     # A None entry in sys.modules makes the import raise ImportError - once
     # the package attribute an earlier import left behind is removed too.
-    import trusttrace 
+    import trusttrace
     monkeypatch.delattr(trusttrace, "demo", raising=False)
     monkeypatch.setitem(sys.modules, "trusttrace.demo", None)
     result = runner.invoke(app, ["demo", "--cases-dir", str(tmp_path / "cases")])

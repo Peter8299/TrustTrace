@@ -11,11 +11,11 @@ import time
 
 import pytest
 
+from tests.test_cli_team import _add_json_case, _ScriptedModel
 from trusttrace.core import ai_assistant, audit, config
 from trusttrace.core.finding import FindingManager
 from trusttrace.web import team_runs
 from trusttrace.web.app import CSRF_HEADER, CSRF_HEADER_VALUE, create_app
-from tests.test_cli_team import _add_json_case, _ScriptedModel
 
 W = {CSRF_HEADER: CSRF_HEADER_VALUE}
 

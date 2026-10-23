@@ -11,7 +11,7 @@ import sys
 def test_package_importable():
     import importlib.metadata
 
-    import trusttrace 
+    import trusttrace
     # One source of truth: pyproject.toml, via the installed metadata.
     assert trusttrace.__version__ == importlib.metadata.version("trusttrace")
 
