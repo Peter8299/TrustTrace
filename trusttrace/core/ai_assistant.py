@@ -607,7 +607,9 @@ def _call_openai_compatible(system_prompt, user_prompt, api_key, model, base_url
 
     Uses the OpenAI SDK which works with any OpenAI-compatible endpoint.
     Requires base_url to be set (e.g., https://openrouter.ai/api/v1,
-    https://integrate.api.nvidia.com/v1, etc.)
+    https://integrate.api.nvidia.com/v1, https://api.groq.com/openai/v1)
+
+    Falls back to JSON response format if function calling (beta.parse) is not supported.
     """
     try:
         import openai
@@ -626,26 +628,67 @@ def _call_openai_compatible(system_prompt, user_prompt, api_key, model, base_url
         "No API key for OpenAI-compatible endpoint. "
         "Use --api-key or set OPENAI_COMPATIBLE_API_KEY (or provider-specific env var)."
     )
-    try:
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        if schema is None:
+
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # If no schema, always use JSON object response format
+    if schema is None:
+        try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 response_format={"type": "json_object"},
                 max_completion_tokens=MAX_TOKENS,
             )
-        else:
-            response = client.beta.chat.completions.parse(
-                model=model,
-                messages=messages,
-                response_format=schema,
-                max_completion_tokens=MAX_TOKENS,
-            )
+        except openai.AuthenticationError as e:
+            raise AssistantError(_rejected_message("OpenAI-compatible", "--api-key or OPENAI_COMPATIBLE_API_KEY")) from e
+        except openai.OpenAIError as e:
+            if "credentials" in str(e).lower() or "api_key" in str(e).lower():
+                raise AssistantError(no_credentials_message) from e
+            raise AssistantError(f"AI request failed: {e}") from e
+        except openai.APIConnectionError as e:
+            raise AssistantError(f"AI request failed: network error - {e}") from e
+        except openai.APIStatusError as e:
+            raise AssistantError(f"AI request failed: {e.message}") from e
+
+        return _json_from_text(response.choices[0].message.content)
+
+    # With schema: try function calling (beta.parse) first, fall back to JSON mode
+    try:
+        response = client.beta.chat.completions.parse(
+            model=model,
+            messages=messages,
+            response_format=schema,
+            max_completion_tokens=MAX_TOKENS,
+        )
+    except openai.APIStatusError as e:
+        # If function calling not supported (404, 400, 501), fall back to JSON mode
+        if e.status_code in (400, 404, 501) or "function" in str(e).lower() or "not support" in str(e).lower():
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_completion_tokens=MAX_TOKENS,
+                )
+            except openai.AuthenticationError as e2:
+                raise AssistantError(_rejected_message("OpenAI-compatible", "--api-key or OPENAI_COMPATIBLE_API_KEY")) from e2
+            except openai.OpenAIError as e2:
+                if "credentials" in str(e2).lower() or "api_key" in str(e2).lower():
+                    raise AssistantError(no_credentials_message) from e2
+                raise AssistantError(f"AI request failed: {e2}") from e2
+            except openai.APIConnectionError as e2:
+                raise AssistantError(f"AI request failed: network error - {e2}") from e2
+            except openai.APIStatusError as e2:
+                raise AssistantError(f"AI request failed: {e2.message}") from e2
+
+            return _json_from_text(response.choices[0].message.content)
+        # Re-raise other API status errors
+        raise AssistantError(f"AI request failed: {e.message}") from e
     except openai.AuthenticationError as e:
         raise AssistantError(_rejected_message("OpenAI-compatible", "--api-key or OPENAI_COMPATIBLE_API_KEY")) from e
     except openai.OpenAIError as e:
@@ -654,12 +697,8 @@ def _call_openai_compatible(system_prompt, user_prompt, api_key, model, base_url
         raise AssistantError(f"AI request failed: {e}") from e
     except openai.APIConnectionError as e:
         raise AssistantError(f"AI request failed: network error - {e}") from e
-    except openai.APIStatusError as e:
-        raise AssistantError(f"AI request failed: {e.message}") from e
 
     message = response.choices[0].message
-    if schema is None:
-        return _json_from_text(message.content)
     if message.parsed is None:
         refusal = f" ({message.refusal})" if getattr(message, "refusal", None) else ""
         raise AssistantError(f"AI response could not be parsed into the expected format.{refusal}")
